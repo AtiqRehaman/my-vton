@@ -1,4 +1,25 @@
 """
+warping/model.py — TPS (Thin Plate Spline) Garment Warping Network
+
+─────────────────────────────────────────────────────────────────
+WHY TPS WARPING?
+─────────────────────────────────────────────────────────────────
+The flat garment photo needs to be deformed to match the person's
+body pose before the diffusion model runs. Without pre-warping:
+  • The diffusion model must both place AND deform the cloth
+  • Fine texture patterns (stripes, logos, prints) get destroyed
+  • Training converges much slower
+
+TPS warping is a classical geometric transformation:
+  • We predict N control points and their offsets (Δx, Δy)
+  • A smooth warp field is interpolated from those control points
+  • torch.nn.functional.grid_sample() applies the warp efficiently
+
+Why not learned flow / optical flow?
+  • TPS is more regularizable — the thin plate spline energy term
+    prevents impossible folds (cloth can't fold onto itself)
+  • CP-VTON, VITON-HD, and HR-VTON all use TPS for the first stage
+
 ─────────────────────────────────────────────────────────────────
 ARCHITECTURE OVERVIEW
 ─────────────────────────────────────────────────────────────────
@@ -279,9 +300,21 @@ class TPSGridGenerator(nn.Module):
         return K.astype(np.float32)
 
     def _tps_kernel_torch(self, pts_a: torch.Tensor, pts_b: torch.Tensor) -> torch.Tensor:
-        """Torch version of TPS kernel for target grid computation."""
-        diff = pts_a.unsqueeze(1) - pts_b.unsqueeze(0)  # (M, N, 2)
-        r2 = (diff ** 2).sum(-1)                         # (M, N)
+        """
+        Torch version of TPS kernel, batched.
+
+        pts_a: (B, M, 2)
+        pts_b: (B, N, 2)
+        Returns: (B, M, N) — per-batch pairwise kernel values
+
+        NOTE: pts_a and pts_b must both carry the batch dimension and
+        must NOT be flattened with .reshape(-1, 2) before calling this —
+        doing so merges the batch dim into the points dim and produces
+        a (B*M, B*N) cross-batch kernel instead of B independent (M,N)
+        kernels, which both inflates memory and computes wrong values.
+        """
+        diff = pts_a.unsqueeze(2) - pts_b.unsqueeze(1)   # (B, M, N, 2)
+        r2 = (diff ** 2).sum(-1)                          # (B, M, N)
         return torch.where(r2 == 0, torch.zeros_like(r2), r2 * torch.log(r2 + 1e-12))
 
     def forward(self, offsets: torch.Tensor) -> torch.Tensor:
@@ -311,14 +344,17 @@ class TPSGridGenerator(nn.Module):
         # target_pts: (H*W, 2)
         M = self.H * self.W
         target = self.target_pts.unsqueeze(0).expand(B, -1, -1)   # (B, M, 2)
-        src_expand = self.src_pts.unsqueeze(0).expand(B, -1, -1)  # (B, N, 2)
 
-        # Kernel values at target pts w.r.t. source control pts
-        # K_target: (B, M, N)
-        K_target = self._tps_kernel_torch(
-            target.reshape(-1, 2),
-            src_expand.reshape(-1, 2).detach()
-        ).view(B, M, N)
+        # Kernel values at target pts w.r.t. source control pts.
+        # target_pts and src_pts are FIXED buffers (identical across the
+        # batch), so compute the (M, N) kernel once on the unbatched
+        # tensors, then broadcast to the batch — this is both correct
+        # and far cheaper than recomputing per batch element.
+        K_target_unbatched = self._tps_kernel_torch(
+            self.target_pts.unsqueeze(0),           # (1, M, 2)
+            self.src_pts.unsqueeze(0).detach(),      # (1, N, 2)
+        )                                              # (1, M, N)
+        K_target = K_target_unbatched.expand(B, -1, -1)   # (B, M, N)
 
         # Polynomial part: [1, x, y] for each target point
         ones = torch.ones(B, M, 1, device=offsets.device, dtype=offsets.dtype)
