@@ -185,17 +185,42 @@ class TPSRegressor(nn.Module):
     def __init__(self, feat_h: int, feat_w: int, n_control_points: int = 25):
         super().__init__()
         self.n_cp = n_control_points
-        in_dim = feat_h * feat_w * feat_h * feat_w  # Ha*Wa × Hb*Wb
+        self.feat_h = feat_h
+        self.feat_w = feat_w
 
-        # Progressive reduction to keep param count reasonable
+        # ── Spatial reduction BEFORE flattening ──
+        # The raw correlation map is (B, Ha*Wa, Hb*Wb) — for 512x384 inputs
+        # that's (B, 768, 768), i.e. 589,824 elements per sample. Flattening
+        # this directly into a single Linear(589824 -> 1024) layer creates
+        # ~604M parameters in that one layer alone (the actual cause of the
+        # earlier 619M-param / CUDA OOM bug). Real TPS-warping papers
+        # (CP-VTON, VITON-HD) always reduce the correlation volume spatially
+        # with conv layers first. We treat the correlation map as a
+        # (Ha*Wa) "channel" stack over an (Hb, Wb) spatial grid, run it
+        # through a small conv stack to collapse the spatial extent down to
+        # a fixed 4x4, and only THEN flatten — keeping the FC layers small.
+        self.in_channels = feat_h * feat_w   # Ha*Wa, treated as channels
+
+        self.reduce = nn.Sequential(
+            nn.Conv2d(self.in_channels, 256, kernel_size=3, stride=2, padding=1),  # /2
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 128, kernel_size=3, stride=2, padding=1),               # /4
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((4, 4)),   # fixed spatial size regardless of feat_h/feat_w
+        )
+        # Flattened size after reduce: 128 * 4 * 4 = 2048 — small and fixed
+        reduced_dim = 128 * 4 * 4
+
         self.regressor = nn.Sequential(
-            nn.Linear(in_dim, 1024),
+            nn.Linear(reduced_dim, 512),
             nn.ReLU(inplace=True),
             nn.Dropout(0.5),
-            nn.Linear(1024, 512),
+            nn.Linear(512, 256),
             nn.ReLU(inplace=True),
             nn.Dropout(0.5),
-            nn.Linear(512, 2 * n_control_points),  # 2× for x and y offsets
+            nn.Linear(256, 2 * n_control_points),  # 2× for x and y offsets
         )
 
         # Initialize final layer to near-zero → small initial deformation
@@ -203,9 +228,11 @@ class TPSRegressor(nn.Module):
         nn.init.zeros_(self.regressor[-1].bias)
 
     def forward(self, corr: torch.Tensor) -> torch.Tensor:
-        # corr: (B, Ha*Wa, Hb*Wb)
+        # corr: (B, Ha*Wa, Hb*Wb) → reshape to (B, Ha*Wa, Hb, Wb) for conv
         B = corr.shape[0]
-        x = corr.view(B, -1)       # flatten
+        x = corr.view(B, self.in_channels, self.feat_h, self.feat_w)
+        x = self.reduce(x)          # (B, 128, 4, 4)
+        x = x.flatten(1)            # (B, 2048)
         offsets = self.regressor(x) # (B, 2*N_cp)
         # Tanh clamps offsets to (-1, 1) in normalized image coordinates
         # This prevents extreme deformations that tear the cloth
