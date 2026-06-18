@@ -3,17 +3,35 @@ human_parser.py — SCHP (Self-Correction for Human Parsing) ONNX wrapper
 
 What it does:
   Takes a person RGB image and outputs a semantic label map where each pixel
-  is assigned one of 20 body-part labels (background, hair, face, clothes, etc.)
+  is assigned one of N body-part labels (background, hair, face, clothes, etc.)
 
 Why we need it:
   We need to know WHERE the current clothes are on the person so we can erase
   them and replace with the new garment. The label map drives agnostic_mask creation.
 
-Label map (ATR — 18 classes, LIP — 20 classes):
+Label maps — ATR (18 classes) and LIP (20 classes) use DIFFERENT
+orderings, not a simple superset/subset of each other. Mixing them up
+silently mislabels which pixels are clothing vs. face vs. limbs.
+
+ATR-18 (used by parsing_atr.onnx):
   0=Background, 1=Hat, 2=Hair, 3=Sunglasses, 4=Upper-clothes, 5=Skirt,
   6=Pants, 7=Dress, 8=Belt, 9=Left-shoe, 10=Right-shoe, 11=Face,
   12=Left-leg, 13=Right-leg, 14=Left-arm, 15=Right-arm, 16=Bag, 17=Scarf
-  (LIP adds: 18=Left-hand, 19=Right-hand)
+
+LIP-20 (used by parsing_lip.onnx AND by VITON-HD's precomputed
+image-parse-v3/*.png files — this is the set you get from real
+dataset data, not the synthetic placeholder):
+  0=Background, 1=Hat, 2=Hair, 3=Glove, 4=Sunglasses, 5=Upper-clothes,
+  6=Dress, 7=Coat, 8=Socks, 9=Pants, 10=Jumpsuits, 11=Scarf, 12=Skirt,
+  13=Face, 14=Left-arm, 15=Right-arm, 16=Left-leg, 17=Right-leg,
+  18=Left-shoe, 19=Right-shoe
+
+Source: PeikeLi/Self-Correction-Human-Parsing (official repo) and the
+LIP dataset paper. An earlier version of this file incorrectly assumed
+LIP_LABELS = ATR_LABELS + ['Left-hand','Right-hand'] — that is WRONG;
+the two orderings share no positional correspondence past index 2.
+Any code consuming LIP-sourced parse maps (e.g. real VITON-HD data)
+must use LIP_LABELS / LIP_CLOTH_LABELS, never the ATR ones.
 """
 
 import numpy as np
@@ -22,16 +40,27 @@ import onnxruntime as ort
 from pathlib import Path
 
 
-# Label names for debugging/visualization
+# ATR-18 label names — produced by parsing_atr.onnx
 ATR_LABELS = [
     'Background', 'Hat', 'Hair', 'Sunglasses', 'Upper-clothes',
     'Skirt', 'Pants', 'Dress', 'Belt', 'Left-shoe', 'Right-shoe',
     'Face', 'Left-leg', 'Right-leg', 'Left-arm', 'Right-arm', 'Bag', 'Scarf'
 ]
 
-LIP_LABELS = ATR_LABELS + ['Left-hand', 'Right-hand']
+# LIP-20 label names — produced by parsing_lip.onnx AND by VITON-HD's
+# precomputed image-parse-v3 files. This ordering is NOT derived from
+# ATR_LABELS; verify against PeikeLi/Self-Correction-Human-Parsing if
+# ever in doubt rather than assuming a relationship between the two sets.
+LIP_LABELS = [
+    'Background', 'Hat', 'Hair', 'Glove', 'Sunglasses', 'Upper-clothes',
+    'Dress', 'Coat', 'Socks', 'Pants', 'Jumpsuits', 'Scarf', 'Skirt',
+    'Face', 'Left-arm', 'Right-arm', 'Left-leg', 'Right-leg',
+    'Left-shoe', 'Right-shoe'
+]
 
-# Color palette for visualization (one BGR color per label)
+# Color palette for visualization (one BGR color per label index).
+# Sized for the larger of the two label sets (LIP-20); ATR-18 simply
+# uses the first 18 entries.
 PALETTE = [
     [0, 0, 0], [128, 0, 0], [0, 128, 0], [128, 128, 0], [0, 0, 128],
     [128, 0, 128], [0, 128, 128], [128, 128, 128], [64, 0, 0], [192, 0, 0],

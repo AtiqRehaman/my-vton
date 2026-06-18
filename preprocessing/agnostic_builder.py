@@ -17,31 +17,52 @@ Why grey specifically?
   or white minimizes the initialization bias when the VAE encodes this image.
   It's a neutral "unknown" signal.
 
-Which labels to erase depends on cloth_type:
-  'upper'  : upper-clothes (4), left-arm (14), right-arm (15)
-  'lower'  : pants (6), skirt (5)
-  'overall': dress (7), upper-clothes (4), pants (6), left-arm (14), right-arm (15)
+Which labels to erase depends on cloth_type AND which label scheme the
+parse map came from. ATR (our own SCHP wrapper's default) and LIP
+(real VITON-HD's precomputed image-parse-v3 files) use DIFFERENT
+index orderings for the same semantic class — see human_parser.py for
+the full breakdown. Using the wrong scheme's indices against the
+other scheme's parse map silently erases/preserves the wrong body
+parts (e.g. erasing the face instead of the upper-clothes).
 
-Label indices (ATR model):
+ATR-18 label indices:
   0=Background, 1=Hat, 2=Hair, 3=Sunglasses, 4=Upper-clothes,
   5=Skirt, 6=Pants, 7=Dress, 8=Belt, 9=Left-shoe, 10=Right-shoe,
   11=Face, 12=Left-leg, 13=Right-leg, 14=Left-arm, 15=Right-arm,
   16=Bag, 17=Scarf
+
+LIP-20 label indices (used by real VITON-HD image-parse-v3/*.png):
+  0=Background, 1=Hat, 2=Hair, 3=Glove, 4=Sunglasses, 5=Upper-clothes,
+  6=Dress, 7=Coat, 8=Socks, 9=Pants, 10=Jumpsuits, 11=Scarf, 12=Skirt,
+  13=Face, 14=Left-arm, 15=Right-arm, 16=Left-leg, 17=Right-leg,
+  18=Left-shoe, 19=Right-shoe
 """
 
 import numpy as np
 import cv2
 
 
-# Which parsing labels to erase per cloth type
+# Which parsing labels to erase per cloth type, keyed by label scheme.
+# 'lip' is the default scheme since real VITON-HD precomputed parse
+# maps and parsing_lip.onnx both use it; 'atr' is kept for parsing_atr.onnx.
 CLOTH_LABELS = {
-    'upper':   [4, 14, 15],          # upper-clothes, left-arm, right-arm
-    'lower':   [5, 6, 8],            # skirt, pants, belt
-    'overall': [4, 5, 6, 7, 14, 15], # everything from top to bottom
+    'atr': {
+        'upper':   [4, 14, 15],          # upper-clothes, left-arm, right-arm
+        'lower':   [5, 6, 8],            # skirt, pants, belt
+        'overall': [4, 5, 6, 7, 14, 15], # upper, skirt, pants, dress, arms
+    },
+    'lip': {
+        'upper':   [5, 7, 14, 15],          # upper-clothes, coat, left-arm, right-arm
+        'lower':   [9, 12, 10],             # pants, skirt, jumpsuits
+        'overall': [5, 6, 7, 9, 10, 12, 14, 15],  # upper, dress, coat, pants, jumpsuits, skirt, arms
+    },
 }
 
-# Additional labels to always preserve (never erase these)
-PRESERVE_LABELS = [0, 1, 2, 11, 17]  # background, hat, hair, face, scarf
+# Labels to always preserve (never erase these), keyed by label scheme.
+PRESERVE_LABELS = {
+    'atr': [0, 1, 2, 11, 17],   # background, hat, hair, face, scarf
+    'lip': [0, 1, 2, 13, 11],   # background, hat, hair, face, scarf
+}
 
 
 class AgnosticBuilder:
@@ -62,11 +83,25 @@ class AgnosticBuilder:
     # Arm extension multiplier — extend arm mask downward to cover wrists
     ARM_EXTENSION_RATIO = 0.3
 
-    def __init__(self, cloth_type: str = 'upper'):
-        if cloth_type not in CLOTH_LABELS:
-            raise ValueError(f"cloth_type must be one of {list(CLOTH_LABELS.keys())}")
+    def __init__(self, cloth_type: str = 'upper', label_scheme: str = 'lip'):
+        """
+        Args:
+            cloth_type:   'upper', 'lower', or 'overall'
+            label_scheme: 'lip' (default — matches real VITON-HD parse
+                          maps and parsing_lip.onnx) or 'atr' (matches
+                          parsing_atr.onnx output). Must match whatever
+                          produced the parse_map you pass to build().
+        """
+        if label_scheme not in CLOTH_LABELS:
+            raise ValueError(f"label_scheme must be one of {list(CLOTH_LABELS.keys())}")
+        if cloth_type not in CLOTH_LABELS[label_scheme]:
+            raise ValueError(
+                f"cloth_type must be one of {list(CLOTH_LABELS[label_scheme].keys())}"
+            )
         self.cloth_type = cloth_type
-        self.labels_to_erase = CLOTH_LABELS[cloth_type]
+        self.label_scheme = label_scheme
+        self.labels_to_erase = CLOTH_LABELS[label_scheme][cloth_type]
+        self.preserve_labels = PRESERVE_LABELS[label_scheme]
 
     def build(
         self,
@@ -105,9 +140,10 @@ class AgnosticBuilder:
         agnostic_mask = cv2.dilate(raw_mask, kernel, iterations=1)
 
         # Step 4: Make sure we preserve face/hair/hands regions
-        # Do NOT erase face (label 11) or hair (label 2)
+        # Uses self.preserve_labels (scheme-aware) — do NOT erase
+        # face/hair even if they happen to fall inside the dilated mask
         preserve_mask = np.zeros((h, w), dtype=np.uint8)
-        for label in PRESERVE_LABELS:
+        for label in self.preserve_labels:
             preserve_mask[parse_map == label] = 255
         # Erode preserve mask slightly to avoid sharp edge artifacts
         erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -199,21 +235,28 @@ def build_agnostic_pair(
     parse_map: np.ndarray,
     keypoints: list | None,
     cloth_type: str = 'upper',
-    target_size: tuple | None = None
+    target_size: tuple | None = None,
+    label_scheme: str = 'lip',
 ) -> dict:
     """
     Convenience function: build agnostic pair and optionally resize.
-    
+
     Args:
-        person_bgr:  H×W×3 BGR
-        parse_map:   H×W uint8
-        keypoints:   list of 18 [x,y,conf] or None
-        cloth_type:  'upper', 'lower', or 'overall'
-        target_size: (W, H) tuple to resize outputs, or None to keep original
+        person_bgr:   H×W×3 BGR
+        parse_map:    H×W uint8
+        keypoints:    list of 18 [x,y,conf] or None
+        cloth_type:   'upper', 'lower', or 'overall'
+        target_size:  (W, H) tuple to resize outputs, or None to keep original
+        label_scheme: 'lip' (default) or 'atr' — MUST match the model
+                      that produced parse_map. Our own HumanParser with
+                      parsing_atr.onnx produces ATR; parsing_lip.onnx
+                      and VITON-HD's precomputed image-parse-v3 files
+                      produce LIP. Passing the wrong scheme silently
+                      erases/preserves the wrong body regions.
     Returns:
         dict with agnostic_mask, agnostic_image, agnostic_mask_vis
     """
-    builder = AgnosticBuilder(cloth_type=cloth_type)
+    builder = AgnosticBuilder(cloth_type=cloth_type, label_scheme=label_scheme)
     result = builder.build(person_bgr, parse_map, keypoints)
 
     if target_size is not None:
