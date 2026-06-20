@@ -288,13 +288,19 @@ class EaseCalculator:
 if __name__ == '__main__':
     calc = EaseCalculator()
 
+    # Ease values verified against the actual TOLERANCES table above,
+    # chosen mid-range on BOTH active regions for 'upper' (chest AND
+    # waist — assess() takes the more severe of the two, so a value
+    # that's mid-range on only one region isn't enough):
+    #   chest:  Too Tight <-2 | Fitted -2..2 | Comfortable 2..6 | Loose 6..14 | Too Large >=14
+    #   waist:  Too Tight <-3 | Fitted -3..1 | Comfortable 1..5 | Loose 5..12 | Too Large >=12
     test_cases = [
         # (person_chest, person_waist, person_hip, garment_chest, garment_waist, garment_hip, expected)
-        (90, 74, 96, 94, 77, 100, 'Comfortable'),    # standard shirt
-        (90, 74, 96, 88, 72, 94,  'Too Tight'),       # too small
-        (90, 74, 96, 104, 87, 110,'Loose'),           # relaxed
-        (90, 74, 96, 115, 98, 120,'Too Large'),       # oversized
-        (90, 74, 96, 92, 75, 97,  'Fitted'),          # close fit
+        (90, 74, 96, 94, 77, 100, 'Comfortable'),    # ease=(+4/+3/+4)  both regions mid-Comfortable
+        (90, 74, 96, 84, 68, 90,  'Too Tight'),      # ease=(-6/-6/-6)  both regions clearly Too Tight
+        (90, 74, 96, 99, 82, 104, 'Loose'),          # ease=(+9/+8/+8)  both regions mid-Loose
+        (90, 74, 96, 115, 98, 120,'Too Large'),      # ease=(+25/+24/+24) both regions clearly Too Large
+        (90, 74, 96, 90, 73, 96,  'Fitted'),         # ease=(+0/-1/+0)  both regions mid-Fitted
     ]
 
     print(f"{'Person':20s} {'Garment':20s} {'Ease (C/W/H)':20s} {'Label':12s} {'Expected':12s} {'OK'}")
