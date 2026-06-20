@@ -453,7 +453,8 @@ def train_classifier(
     # produce false alarms about the classifier without revealing any
     # actual user-facing bug.
     print("\nManual test cases (all garment types, full assess() pipeline):")
-    from fit.ease_calculator import PersonMeasurements, GarmentMeasurements
+    from fit.ease_calculator import EaseCalculator, PersonMeasurements, GarmentMeasurements
+    calc = EaseCalculator()
     test_manual = [
         # upper
         (4, 3, 4,    'upper',   'Comfortable'),   # spec example: chest=90, garment=94 → ease=+4
