@@ -234,57 +234,64 @@ class GenerationTrainer:
         from generation.unet_modified import VTONUNet
         from generation.pipeline import LatentEncoder, EMAModel
         from fit.measurement_encoder import MeasurementEncoder
-
+    
         mid = self.cfg['model_id']
         print(f"Loading base model: {mid}")
-
-        # Frozen components
+    
+        # ── Frozen components: safe to load in self.dtype (fp16 on GPU) ──
+        # These are NEVER touched by the optimizer or GradScaler, so their
+        # parameters being fp16 is fine — only forward-pass inference runs
+        # through them.
         self.vae = AutoencoderKL.from_pretrained(
             mid, subfolder='vae', torch_dtype=self.dtype
         ).to(self.device)
         for p in self.vae.parameters():
             p.requires_grad = False
-
+    
         self.text_encoder = CLIPTextModel.from_pretrained(
             mid, subfolder='text_encoder', torch_dtype=self.dtype
         ).to(self.device)
         for p in self.text_encoder.parameters():
             p.requires_grad = False
-
+    
         self.tokenizer = CLIPTokenizer.from_pretrained(mid, subfolder='tokenizer')
-
-        # Training noise scheduler (DDPM — uniform timestep sampling)
-        self.noise_scheduler = DDPMScheduler.from_pretrained(
-            mid, subfolder='scheduler'
-        )
-        # Inference scheduler (DDIM — faster)
-        self.ddim_scheduler = DDIMScheduler.from_pretrained(
-            mid, subfolder='scheduler'
-        )
-
-        # Trainable: UNet + fit encoder
+    
+        self.noise_scheduler = DDPMScheduler.from_pretrained(mid, subfolder='scheduler')
+        self.ddim_scheduler  = DDIMScheduler.from_pretrained(mid, subfolder='scheduler')
+    
+        # ── Trainable components: MUST stay fp32 ──
+        # GradScaler.unscale_() only operates on fp32 gradients — this is
+        # the standard "fp32 master weights + autocast fp16 forward pass"
+        # AMP pattern. Loading these in fp16 causes:
+        #   ValueError: Attempting to unscale FP16 gradients
+        # autocast() (already used in _train_step via
+        # torch.cuda.amp.autocast(enabled=self.use_fp16)) handles running
+        # the forward pass in fp16 internally — the weights don't need to
+        # BE fp16 for activations to get fp16 memory/speed benefits.
         self.unet = VTONUNet.from_pretrained(
-            mid, torch_dtype=self.dtype, device=str(self.device)
+            mid, torch_dtype=torch.float32, device=str(self.device)
         )
         if self.cfg['grad_ckpt']:
             self.unet.enable_gradient_checkpointing()
             print("  Gradient checkpointing: ON")
         if self.cfg['xformers']:
             self.unet.enable_xformers_memory_efficient_attention()
-
+    
         self.fit_encoder = MeasurementEncoder(
             target_h=self.cfg['target_h'],
             target_w=self.cfg['target_w'],
-        ).to(device=self.device, dtype=self.dtype)
-
-        # EMA — initialized from current UNet weights
+        ).to(device=self.device, dtype=torch.float32)
+    
+        # EMA — built AFTER unet/fit_encoder are fp32, so shadow buffers
+        # are fp32 too (matches what GradScaler/optimizer expect)
         self.ema = EMAModel(
             list(self.unet.parameters()) + list(self.fit_encoder.parameters()),
             decay=self.cfg['ema_decay'],
         )
-
+    
         self.lat_enc = LatentEncoder(self.vae)
-        print("All models loaded.")
+        print("All models loaded. Trainable params: fp32 | Frozen VAE/CLIP: "
+            f"{self.dtype}")
 
     # ── Dataset & DataLoader ─────────────────────────────────────
 
