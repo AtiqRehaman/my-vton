@@ -340,12 +340,37 @@ class GenerationTrainer:
             list(self.unet.parameters()) +
             list(self.fit_encoder.parameters())
         )
-        self.optimizer = torch.optim.AdamW(
-            trainable,
-            lr           = self.cfg['lr'],
-            weight_decay = self.cfg['weight_decay'],
-        )
-        # Cosine annealing — smoothly decays LR to 0 over num_steps
+    
+        # 8-bit AdamW: keeps exp_avg/exp_avg_sq momentum buffers in 8-bit
+        # instead of fp32 — cuts optimizer state from ~6.9GB to ~1.7GB for
+        # this model size. This is what makes fine-tuning the full 860M
+        # UNet fit on a T4's 14.56GB at all; with standard fp32 AdamW,
+        # static weights+gradients+optimizer state alone exceed the card
+        # before a single activation tensor is allocated.
+        #
+        # Falls back to standard torch.optim.AdamW with a clear warning if
+        # bitsandbytes isn't installed, rather than failing silently into
+        # the same OOM this is meant to fix.
+        try:
+            import bitsandbytes as bnb
+            self.optimizer = bnb.optim.AdamW8bit(
+                trainable,
+                lr           = self.cfg['lr'],
+                weight_decay = self.cfg['weight_decay'],
+            )
+            print("  Optimizer: AdamW8bit (bitsandbytes) — required to fit "
+                "the full UNet fine-tune on a T4")
+        except ImportError:
+            print("  ⚠️  bitsandbytes not installed — falling back to standard "
+                "AdamW.\\n"
+                "      This WILL OOM on a T4 at fp32. Run: pip install "
+                "bitsandbytes")
+            self.optimizer = torch.optim.AdamW(
+                trainable,
+                lr           = self.cfg['lr'],
+                weight_decay = self.cfg['weight_decay'],
+            )
+    
         self.scheduler = CosineAnnealingLR(
             self.optimizer,
             T_max  = self.cfg['num_steps'],
