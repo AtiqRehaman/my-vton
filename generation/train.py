@@ -77,7 +77,7 @@ DEFAULT_CONFIG = {
     'lr':           1e-5,
     'weight_decay': 0.01,
     'val_every':    5_000,       # run val every N steps
-    'save_every':   5_000,       # save checkpoint every N steps
+    'save_every':   500,         # save checkpoint every N steps
     'vis_every':    500,         # save sample images every N steps
     'val_split':    0.1,
     'num_workers':  2,           # Colab: keep low
