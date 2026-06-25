@@ -650,15 +650,38 @@ class GenerationTrainer:
         print(f"  Saved: {fname}")
 
     def load_checkpoint(self, path: str) -> int:
-        ckpt = torch.load(path, map_location=self.device)
+        # Load to CPU, not GPU. torch.load with map_location='cpu' never
+        # touches the GPU during deserialization -- the whole checkpoint
+        # sits in CPU RAM first. Each load_state_dict() call below then
+        # moves ONE tensor to GPU at a time as it overwrites the live
+        # tensor, instead of torch.load materializing the ENTIRE
+        # checkpoint dict on GPU simultaneously alongside the already-live
+        # model/optimizer/EMA state. That simultaneous double-allocation
+        # is what caused the OOM on resume once the optimizer state grew
+        # past trivial size (~step 2000+).
+        ckpt = torch.load(path, map_location='cpu')
+    
         self.unet.load_state_dict(ckpt['model'], strict=False)
         self.fit_encoder.load_state_dict(ckpt['fit_encoder'])
         self.optimizer.load_state_dict(ckpt['optimizer'])
         self.scheduler.load_state_dict(ckpt['scheduler'])
         self.scaler.load_state_dict(ckpt['scaler'])
         self.ema.load_state_dict(ckpt['ema'])
+    
         self.best_ssim   = ckpt.get('best_ssim', 0.0)
         self.global_step = ckpt.get('step', 0)
+    
+        # Drop the CPU-resident checkpoint dict explicitly and clear the
+        # CUDA allocator's cached (but unused) blocks -- not strictly
+        # required since load_state_dict() already copied what it needed
+        # onto GPU tensors that own their own memory, but this keeps peak
+        # CPU RAM lower on Colab too and is good practice after a large
+        # deserialization.
+        del ckpt
+        import gc; gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
         print(f"Resumed from {path} | step={self.global_step}")
         return self.global_step
 
