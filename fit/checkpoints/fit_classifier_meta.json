@@ -1,0 +1,19 @@
+{
+  "n_estimators": 200,
+  "n_features": 4,
+  "classes": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "feature_importances": {
+    "ease_chest": 0.216238289511037,
+    "ease_waist": 0.5845074784267495,
+    "ease_hip": 0.19091110754237942,
+    "garment_type": 0.008343124519833942
+  },
+  "test_accuracy": 0.9928,
+  "n_samples_trained": 50000
+}
