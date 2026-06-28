@@ -633,98 +633,114 @@ class GenerationTrainer:
 
     # ── Checkpoint ───────────────────────────────────────────────
 
-    def _state_dict_to_cpu(self, module_or_optimizer) -> dict:
-        """
-        Move a state_dict to CPU explicitly, tensor by tensor, rather
-        than letting torch.save() pull the whole thing to CPU internally
-        in one shot. This doesn't reduce the TOTAL bytes copied, but it
-        lets us free each big piece (gc.collect()) before building the
-        next one, so peak CPU RAM usage is closer to "one model's worth"
-        rather than "model + EMA + optimizer all alive on CPU at once."
+    # def _state_dict_to_cpu(self, module_or_optimizer) -> dict:
+    #     """
+    #     Move a state_dict to CPU explicitly, tensor by tensor, rather
+    #     than letting torch.save() pull the whole thing to CPU internally
+    #     in one shot. This doesn't reduce the TOTAL bytes copied, but it
+    #     lets us free each big piece (gc.collect()) before building the
+    #     next one, so peak CPU RAM usage is closer to "one model's worth"
+    #     rather than "model + EMA + optimizer all alive on CPU at once."
     
-        Handles both plain module state_dicts ({name: tensor, ...}) and
-        optimizer state_dicts, which have the shape:
-            {'state': {param_idx: {'step': tensor, 'exp_avg': tensor,
-                                    'exp_avg_sq': tensor}, ...},
-            'param_groups': [{'lr': ..., 'params': [...]}, ...]}
-        i.e. exactly TWO levels of nesting for 'state', and a
-        tensor-free 'param_groups' list — not arbitrary depth.
-        """
-        sd = module_or_optimizer.state_dict()
+    #     Handles both plain module state_dicts ({name: tensor, ...}) and
+    #     optimizer state_dicts, which have the shape:
+    #         {'state': {param_idx: {'step': tensor, 'exp_avg': tensor,
+    #                                 'exp_avg_sq': tensor}, ...},
+    #         'param_groups': [{'lr': ..., 'params': [...]}, ...]}
+    #     i.e. exactly TWO levels of nesting for 'state', and a
+    #     tensor-free 'param_groups' list — not arbitrary depth.
+    #     """
+    #     sd = module_or_optimizer.state_dict()
     
-        if 'state' in sd and 'param_groups' in sd:
-            # Optimizer state_dict shape
-            cpu_state = {
-                param_idx: {
-                    k: (v.detach().cpu() if torch.is_tensor(v) else v)
-                    for k, v in per_param_state.items()
-                }
-                for param_idx, per_param_state in sd['state'].items()
-            }
-            return {'state': cpu_state, 'param_groups': sd['param_groups']}
+    #     if 'state' in sd and 'param_groups' in sd:
+    #         # Optimizer state_dict shape
+    #         cpu_state = {
+    #             param_idx: {
+    #                 k: (v.detach().cpu() if torch.is_tensor(v) else v)
+    #                 for k, v in per_param_state.items()
+    #             }
+    #             for param_idx, per_param_state in sd['state'].items()
+    #         }
+    #         return {'state': cpu_state, 'param_groups': sd['param_groups']}
     
-        # Plain module state_dict shape: {name: tensor, ...}
-        return {
-            k: (v.detach().cpu() if torch.is_tensor(v) else v)
-            for k, v in sd.items()
-        }
+    #     # Plain module state_dict shape: {name: tensor, ...}
+    #     return {
+    #         k: (v.detach().cpu() if torch.is_tensor(v) else v)
+    #         for k, v in sd.items()
+    #     }
+    
+    # def save_checkpoint(self, tag: str = ''):
+    #     import gc
+    
+    #     fname      = f'step_{self.global_step:07d}{tag}.pth'
+    #     final_path = self.out_dir / fname
+    #     tmp_path   = self.out_dir / f'{fname}.tmp'
+    
+    #     # Build the checkpoint dict INCREMENTALLY, moving each piece to
+    #     # CPU and running gc.collect() between the large ones, so we
+    #     # never hold unet + EMA + optimizer all as live CPU copies at
+    #     # once -- that simultaneous peak is what exhausted system RAM.
+    #     ckpt = {'step': self.global_step, 'config': self.cfg, 'best_ssim': self.best_ssim}
+    
+    #     ckpt['model'] = self._state_dict_to_cpu(self.unet)
+    #     gc.collect()
+    
+    #     ckpt['fit_encoder'] = self._state_dict_to_cpu(self.fit_encoder)
+    #     gc.collect()
+    
+    #     ckpt['optimizer'] = self._state_dict_to_cpu(self.optimizer)
+    #     gc.collect()
+    
+    #     ckpt['scheduler'] = self.scheduler.state_dict()   # tiny, no tensors
+    #     ckpt['scaler']    = self.scaler.state_dict()       # tiny, no tensors
+    
+    #     # EMA shadow buffers are already plain tensors (not wrapped in a
+    #     # module/optimizer), so move them directly
+    #     ema_state = self.ema.state_dict()
+    #     ckpt['ema'] = {
+    #         'decay':  ema_state['decay'],
+    #         'shadow': [s.detach().cpu() for s in ema_state['shadow']],
+    #     }
+    #     gc.collect()
+    
+    #     # Write to a temp file first, then atomically rename. If the
+    #     # process dies during torch.save() (OOM, Colab disconnect,
+    #     # manual interrupt), the .tmp file is left orphaned but the REAL
+    #     # checkpoint filename never points at a half-written file --
+    #     # this is what "the .pth was not saved completely" was actually
+    #     # describing: a crash mid-write corrupting the destination file
+    #     # directly, because the old code wrote straight to it.
+    #     try:
+    #         torch.save(ckpt, tmp_path)
+    #         os.replace(tmp_path, final_path)   # atomic on same filesystem
+    #         print(f"  Saved checkpoint: {fname}")
+    #     except Exception as e:
+    #         # Clean up the partial .tmp file so it doesn't get mistaken
+    #         # for a real checkpoint later, and re-raise -- we'd rather
+    #         # fail loudly here than leave ambiguous half-written files.
+    #         if tmp_path.exists():
+    #             tmp_path.unlink()
+    #         print(f"  ❌ Checkpoint save FAILED at step {self.global_step}: {e}")
+    #         raise
+    #     finally:
+    #         del ckpt
+    #         gc.collect()
     
     def save_checkpoint(self, tag: str = ''):
-        import gc
-    
-        fname      = f'step_{self.global_step:07d}{tag}.pth'
-        final_path = self.out_dir / fname
-        tmp_path   = self.out_dir / f'{fname}.tmp'
-    
-        # Build the checkpoint dict INCREMENTALLY, moving each piece to
-        # CPU and running gc.collect() between the large ones, so we
-        # never hold unet + EMA + optimizer all as live CPU copies at
-        # once -- that simultaneous peak is what exhausted system RAM.
-        ckpt = {'step': self.global_step, 'config': self.cfg, 'best_ssim': self.best_ssim}
-    
-        ckpt['model'] = self._state_dict_to_cpu(self.unet)
-        gc.collect()
-    
-        ckpt['fit_encoder'] = self._state_dict_to_cpu(self.fit_encoder)
-        gc.collect()
-    
-        ckpt['optimizer'] = self._state_dict_to_cpu(self.optimizer)
-        gc.collect()
-    
-        ckpt['scheduler'] = self.scheduler.state_dict()   # tiny, no tensors
-        ckpt['scaler']    = self.scaler.state_dict()       # tiny, no tensors
-    
-        # EMA shadow buffers are already plain tensors (not wrapped in a
-        # module/optimizer), so move them directly
-        ema_state = self.ema.state_dict()
-        ckpt['ema'] = {
-            'decay':  ema_state['decay'],
-            'shadow': [s.detach().cpu() for s in ema_state['shadow']],
+        ckpt = {
+            'step':         self.global_step,
+            'model':        self.unet.state_dict(),
+            'fit_encoder':  self.fit_encoder.state_dict(),
+            'optimizer':    self.optimizer.state_dict(),
+            'scheduler':    self.scheduler.state_dict(),
+            'scaler':       self.scaler.state_dict(),
+            'ema':          self.ema.state_dict(),
+            'config':       self.cfg,
+            'best_ssim':    self.best_ssim,
         }
-        gc.collect()
-    
-        # Write to a temp file first, then atomically rename. If the
-        # process dies during torch.save() (OOM, Colab disconnect,
-        # manual interrupt), the .tmp file is left orphaned but the REAL
-        # checkpoint filename never points at a half-written file --
-        # this is what "the .pth was not saved completely" was actually
-        # describing: a crash mid-write corrupting the destination file
-        # directly, because the old code wrote straight to it.
-        try:
-            torch.save(ckpt, tmp_path)
-            os.replace(tmp_path, final_path)   # atomic on same filesystem
-            print(f"  Saved checkpoint: {fname}")
-        except Exception as e:
-            # Clean up the partial .tmp file so it doesn't get mistaken
-            # for a real checkpoint later, and re-raise -- we'd rather
-            # fail loudly here than leave ambiguous half-written files.
-            if tmp_path.exists():
-                tmp_path.unlink()
-            print(f"  ❌ Checkpoint save FAILED at step {self.global_step}: {e}")
-            raise
-        finally:
-            del ckpt
-            gc.collect()
+        fname = f'step_{self.global_step:07d}{tag}.pth'
+        torch.save(ckpt, self.out_dir / fname)
+        print(f"  Saved: {fname}")
 
     def load_checkpoint(self, path: str) -> int:
         # Load to CPU, not GPU. torch.load with map_location='cpu' never
