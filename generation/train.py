@@ -15,37 +15,94 @@ Loss: standard diffusion noise prediction loss (MSE)
     5. Predict noise: ε_pred = UNet(z_t, t, all_conditioning)
     6. Loss = MSE(ε_pred, ε)
 
-Optimizer: AdamW, lr=1e-5, weight_decay=0.01
-  Why 1e-5 (not 1e-4 from warping)?
-  The UNet was pretrained — too high LR destroys pretrained weights.
-  1e-5 is the standard fine-tuning LR for SD 1.5.
+Optimizer: AdamW8bit, lr=1e-5, weight_decay=0.01
+  Why 1e-5? The UNet was pretrained — too high LR destroys
+  pretrained weights. 1e-5 is the standard fine-tuning LR for SD 1.5.
 
-Gradient checkpointing: MANDATORY on T4
-  Reduces VRAM from ~13 GB to ~8 GB at cost of ~20% slower step.
-  Without it, B=1 at 512×384 barely fits; B=2 causes OOM.
+  Why AdamW8bit (bitsandbytes), not torch.optim.AdamW?
+  Fine-tuning the FULL ~860M-parameter SD UNet at fp32 needs roughly:
+      weights (fp32):            3.44 GB
+      gradients (fp32):           3.44 GB
+      AdamW fp32 exp_avg:         3.44 GB
+      AdamW fp32 exp_avg_sq:      3.44 GB
+      ─────────────────────────────────
+      Subtotal:                  13.76 GB  ← exceeds a T4's 14.56 GB
+                                              before a single activation
+                                              tensor is allocated.
+  AdamW8bit keeps exp_avg/exp_avg_sq in 8-bit instead of fp32 — cuts
+  that to ~1.7 GB combined, which is what makes full UNet fine-tuning
+  fit on a T4 (or Kaggle's P100/T4) at all. Falls back to standard
+  AdamW with a loud warning if bitsandbytes isn't installed.
 
-EMA: decay=0.9999, applied after every optimizer step
-  Used for inference — gives smoother, more realistic outputs.
+Mixed precision — IMPORTANT, this is the one configuration detail
+most likely to be gotten wrong:
+  Trainable models (unet, fit_encoder) are ALWAYS loaded/kept in
+  fp32, regardless of the 'fp16' config flag. GradScaler.unscale_()
+  only operates on fp32 gradients — loading trainable weights in fp16
+  causes "ValueError: Attempting to unscale FP16 gradients" the first
+  time backward() runs.
+  The 'fp16' flag instead controls:
+    (a) dtype of the FROZEN components (VAE, CLIP text encoder) —
+        these are never touched by the optimizer/scaler, so fp16 is
+        safe and saves real memory for them.
+    (b) whether torch.cuda.amp.autocast() runs the forward pass in
+        fp16 — this is what gives you fp16-speed/memory benefits on
+        ACTIVATIONS without the weights themselves needing to be fp16.
+  Leave 'fp16': True. Setting it False does not protect against any
+  remaining bug — it just doubles frozen-component memory and disables
+  autocast's activation savings, which has caused OOM in its own right
+  before.
 
-Text conditioning: 10% null-text dropout (classifier-free guidance)
-  10% of training steps use empty string prompt.
-  This enables CFG at inference time (guidance_scale=2.0).
+Gradient checkpointing: MANDATORY on T4-class GPUs (including
+  Kaggle's T4 and P100). Reduces activation VRAM substantially at the
+  cost of ~20% slower steps — without it, even B=1 struggles to fit
+  alongside the fp32 trainable weights + AdamW8bit state above.
+
+EMA: decay=0.9999, applied after every optimizer step. EMA shadow
+  buffers are fp32 (same dtype as the trainable params they track) —
+  this falls out automatically since EMAModel is constructed AFTER
+  unet/fit_encoder are already fp32, no separate handling needed.
+
+Text conditioning: 10% null-text dropout (classifier-free guidance).
+  10% of training steps use empty string prompt, enabling CFG at
+  inference time (guidance_scale=2.0).
+
+Checkpoint save/load — both deliberately avoid materializing a full
+  extra GPU- or CPU-resident copy of the checkpoint all at once:
+    - save_checkpoint() moves each state_dict to CPU incrementally
+      (one component at a time, with gc.collect() between), then
+      writes to a temp file and atomically renames — so a crash
+      mid-write never leaves a corrupted file at the real checkpoint
+      filename.
+    - load_checkpoint() loads with map_location='cpu' (never touches
+      GPU during deserialization) and lets each load_state_dict()
+      transfer its own tensors to GPU as it overwrites the live ones,
+      rather than torch.load materializing the whole checkpoint on
+      GPU simultaneously alongside the already-live model.
+  Both of these were root-caused from real OOM/RAM-exhaustion crashes
+  during long Colab training runs — see project history for the
+  exact tracebacks that motivated each one.
 
 ─────────────────────────────────────────────────────────────────
-VRAM BUDGET (T4, 15 GB, FP16)
+VRAM BUDGET (T4-class, ~15 GB, fp32 trainable + fp16 frozen + AdamW8bit)
 ─────────────────────────────────────────────────────────────────
-  UNet (B=2, grad ckpt ON):   ~7.5 GB
-  VAE (frozen, encode only):  ~1.0 GB
-  CLIP (frozen):              ~0.6 GB
-  VGG perceptual (eval only): ~0.3 GB
-  Optimizer states (AdamW):   ~1.5 GB
-  EMA weights:                ~0.7 GB
-  Activations + buffers:      ~1.5 GB
-  Total:                     ~13.1 GB ← fits T4 at B=2
+  UNet + fit_encoder weights (fp32):    ~3.44 GB
+  Gradients (fp32):                      ~3.44 GB
+  AdamW8bit state (8-bit):                ~1.72 GB
+  VAE + CLIP (frozen, fp16):              ~0.41 GB
+  EMA shadow (fp32):                      ~3.44 GB
+  ─────────────────────────────────────────────
+  Static subtotal:                       ~12.45 GB
+  Activations (B=2, grad ckpt ON):        ~1.5-2 GB
+  ─────────────────────────────────────────────
+  Total:                                 ~14-14.5 GB ← tight but fits
+                                                          a 14.56GB T4
+  If this still OOMs: reduce batch_size to 1 first (cheapest lever).
 ─────────────────────────────────────────────────────────────────
 """
 
 import os
+import gc
 import json
 import time
 import argparse
@@ -60,10 +117,16 @@ import numpy as np
 from tqdm import tqdm
 
 
+# Kaggle defaults — /kaggle/working is the only writable directory;
+# /kaggle/input/... is READ-ONLY (mounted dataset). Adjust the input
+# path to match your actual dataset slug, e.g.:
+#   /kaggle/input/preprocessed-dataset/preprocessed_dataset/train_manifest.json
+# Override these via the config dict passed to GenerationTrainer —
+# they're just sane starting points, not hardcoded requirements.
 DEFAULT_CONFIG = {
     # Data
-    'manifest':     'preprocessed_dataset/train_manifest.json',
-    'output_dir':   'generation/checkpoints',
+    'manifest':     '/kaggle/input/preprocessed-dataset/preprocessed_dataset/train_manifest.json',
+    'output_dir':   '/kaggle/working/my-vton/generation/checkpoints',
     'cloth_type':   'upper',
     'target_h':     512,
     'target_w':     384,
@@ -72,15 +135,15 @@ DEFAULT_CONFIG = {
     'model_id':     'sd-legacy/stable-diffusion-v1-5',
 
     # Training
-    'batch_size':   2,           # T4 at 512×384 with grad ckpt
+    'batch_size':   2,           # T4/P100 at 512×384 with grad ckpt + AdamW8bit
     'num_steps':    50_000,      # total optimizer steps
     'lr':           1e-5,
     'weight_decay': 0.01,
     'val_every':    5_000,       # run val every N steps
-    'save_every':   500,         # save checkpoint every N steps
+    'save_every':   5_000,       # save checkpoint every N steps
     'vis_every':    500,         # save sample images every N steps
     'val_split':    0.1,
-    'num_workers':  2,           # Colab: keep low
+    'num_workers':  2,           # Kaggle: keep low, same caution as Colab
     'seed':         42,
 
     # Diffusion
@@ -91,9 +154,14 @@ DEFAULT_CONFIG = {
     'loss_type':    'mse',       # 'mse' or 'huber'
 
     # Hardware
-    'fp16':         True,
-    'grad_ckpt':    True,        # gradient checkpointing (MANDATORY on T4)
+    'fp16':         True,        # controls FROZEN component dtype + autocast.
+                                  # Trainable weights are ALWAYS fp32 regardless
+                                  # — see module docstring. Do not set False as
+                                  # a workaround; it doesn't fix anything anymore
+                                  # and wastes memory.
+    'grad_ckpt':    True,        # gradient checkpointing (MANDATORY on T4/P100)
     'xformers':     False,       # set True if xformers is installed
+    'use_8bit_adam': True,       # MANDATORY in practice — see VRAM budget above
     'ema_decay':    0.9999,
     'grad_clip':    1.0,
 
@@ -154,7 +222,7 @@ class MetricsCalculator:
         self._init_models()
         metrics = {}
 
-        # ── SSIM (from torchmetrics or skimage) ──
+        # ── SSIM (from torchmetrics) ──
         try:
             from torchmetrics.functional import structural_similarity_index_measure as ssim
             ssim_val = ssim(
@@ -204,16 +272,22 @@ class GenerationTrainer:
         set_seed(self.cfg['seed'])
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # NOTE: self.dtype controls FROZEN components (VAE, CLIP) and
+        # autocast — it does NOT control trainable weight dtype.
+        # Trainable models are forced to fp32 explicitly in
+        # _load_models() regardless of this value. See module docstring.
         self.dtype  = torch.float16 if (self.cfg['fp16'] and self.device.type == 'cuda') \
                       else torch.float32
-        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.dtype == torch.float16))
+        self.use_fp16 = (self.dtype == torch.float16)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_fp16)
 
         self.out_dir = Path(self.cfg['output_dir'])
         self.vis_dir = self.out_dir / 'vis'
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.vis_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"Device: {self.device} | dtype: {self.dtype}")
+        print(f"Device: {self.device} | frozen/autocast dtype: {self.dtype} "
+              f"| trainable dtype: float32 (always)")
 
         self._load_models()
         self._build_datasets()
@@ -234,40 +308,37 @@ class GenerationTrainer:
         from generation.unet_modified import VTONUNet
         from generation.pipeline import LatentEncoder, EMAModel
         from fit.measurement_encoder import MeasurementEncoder
-    
+
         mid = self.cfg['model_id']
         print(f"Loading base model: {mid}")
-    
+
         # ── Frozen components: safe to load in self.dtype (fp16 on GPU) ──
-        # These are NEVER touched by the optimizer or GradScaler, so their
-        # parameters being fp16 is fine — only forward-pass inference runs
-        # through them.
+        # Never touched by the optimizer/GradScaler — only forward-pass
+        # inference runs through them, so fp16 here is pure savings with
+        # no GradScaler interaction to worry about.
         self.vae = AutoencoderKL.from_pretrained(
             mid, subfolder='vae', torch_dtype=self.dtype
         ).to(self.device)
         for p in self.vae.parameters():
             p.requires_grad = False
-    
+
         self.text_encoder = CLIPTextModel.from_pretrained(
             mid, subfolder='text_encoder', torch_dtype=self.dtype
         ).to(self.device)
         for p in self.text_encoder.parameters():
             p.requires_grad = False
-    
+
         self.tokenizer = CLIPTokenizer.from_pretrained(mid, subfolder='tokenizer')
-    
+
         self.noise_scheduler = DDPMScheduler.from_pretrained(mid, subfolder='scheduler')
         self.ddim_scheduler  = DDIMScheduler.from_pretrained(mid, subfolder='scheduler')
-    
-        # ── Trainable components: MUST stay fp32 ──
-        # GradScaler.unscale_() only operates on fp32 gradients — this is
-        # the standard "fp32 master weights + autocast fp16 forward pass"
-        # AMP pattern. Loading these in fp16 causes:
-        #   ValueError: Attempting to unscale FP16 gradients
-        # autocast() (already used in _train_step via
-        # torch.cuda.amp.autocast(enabled=self.use_fp16)) handles running
-        # the forward pass in fp16 internally — the weights don't need to
-        # BE fp16 for activations to get fp16 memory/speed benefits.
+
+        # ── Trainable components: MUST stay fp32, regardless of self.dtype ──
+        # GradScaler.unscale_() only operates on fp32 gradients. Loading
+        # these in fp16 causes "ValueError: Attempting to unscale FP16
+        # gradients" the first time backward() runs. autocast() (used in
+        # _train_step) already gives fp16 forward-pass benefits on
+        # activations without the weights themselves needing to be fp16.
         self.unet = VTONUNet.from_pretrained(
             mid, torch_dtype=torch.float32, device=str(self.device)
         )
@@ -276,22 +347,22 @@ class GenerationTrainer:
             print("  Gradient checkpointing: ON")
         if self.cfg['xformers']:
             self.unet.enable_xformers_memory_efficient_attention()
-    
+
         self.fit_encoder = MeasurementEncoder(
             target_h=self.cfg['target_h'],
             target_w=self.cfg['target_w'],
         ).to(device=self.device, dtype=torch.float32)
-    
-        # EMA — built AFTER unet/fit_encoder are fp32, so shadow buffers
-        # are fp32 too (matches what GradScaler/optimizer expect)
+
+        # EMA — constructed AFTER unet/fit_encoder are confirmed fp32,
+        # so shadow buffers are fp32 too (dtype-consistent with the
+        # live params EMAModel.step()/.copy_to() operate on).
         self.ema = EMAModel(
             list(self.unet.parameters()) + list(self.fit_encoder.parameters()),
             decay=self.cfg['ema_decay'],
         )
-    
+
         self.lat_enc = LatentEncoder(self.vae)
-        print("All models loaded. Trainable params: fp32 | Frozen VAE/CLIP: "
-            f"{self.dtype}")
+        print(f"All models loaded. Trainable: fp32 | Frozen VAE/CLIP: {self.dtype}")
 
     # ── Dataset & DataLoader ─────────────────────────────────────
 
@@ -328,7 +399,6 @@ class GenerationTrainer:
             num_workers = self.cfg['num_workers'],
             pin_memory  = (self.device.type == 'cuda'),
         )
-        # Steps per epoch — for logging
         self.steps_per_epoch = len(self.train_loader)
         print(f"Train: {n_train} | Val: {n_val} | "
               f"Steps/epoch: {self.steps_per_epoch}")
@@ -340,37 +410,43 @@ class GenerationTrainer:
             list(self.unet.parameters()) +
             list(self.fit_encoder.parameters())
         )
-    
-        # 8-bit AdamW: keeps exp_avg/exp_avg_sq momentum buffers in 8-bit
-        # instead of fp32 — cuts optimizer state from ~6.9GB to ~1.7GB for
-        # this model size. This is what makes fine-tuning the full 860M
-        # UNet fit on a T4's 14.56GB at all; with standard fp32 AdamW,
-        # static weights+gradients+optimizer state alone exceed the card
-        # before a single activation tensor is allocated.
-        #
-        # Falls back to standard torch.optim.AdamW with a clear warning if
-        # bitsandbytes isn't installed, rather than failing silently into
-        # the same OOM this is meant to fix.
-        try:
-            import bitsandbytes as bnb
-            self.optimizer = bnb.optim.AdamW8bit(
-                trainable,
-                lr           = self.cfg['lr'],
-                weight_decay = self.cfg['weight_decay'],
-            )
-            print("  Optimizer: AdamW8bit (bitsandbytes) — required to fit "
-                "the full UNet fine-tune on a T4")
-        except ImportError:
-            print("  ⚠️  bitsandbytes not installed — falling back to standard "
-                "AdamW.\\n"
-                "      This WILL OOM on a T4 at fp32. Run: pip install "
-                "bitsandbytes")
+
+        # 8-bit AdamW: keeps exp_avg/exp_avg_sq momentum buffers in
+        # 8-bit instead of fp32 — cuts optimizer state from ~6.9GB to
+        # ~1.7GB for this model size. This is what makes fine-tuning
+        # the full ~860M-param UNet fit on a T4/P100 at all; with
+        # standard fp32 AdamW, static weights+gradients+optimizer
+        # state alone exceed a 14.56GB T4 before a single activation
+        # tensor is allocated. See module docstring for the full
+        # VRAM breakdown.
+        use_8bit = self.cfg.get('use_8bit_adam', True)
+        if use_8bit:
+            try:
+                import bitsandbytes as bnb
+                self.optimizer = bnb.optim.AdamW8bit(
+                    trainable,
+                    lr           = self.cfg['lr'],
+                    weight_decay = self.cfg['weight_decay'],
+                )
+                print("  Optimizer: AdamW8bit (bitsandbytes) — required to "
+                      "fit the full UNet fine-tune on a 14-16GB GPU")
+            except ImportError:
+                print("  ⚠️  bitsandbytes not installed — falling back to "
+                      "standard AdamW.\n"
+                      "      This WILL likely OOM at fp32 on a T4/P100. "
+                      "Run: pip install bitsandbytes")
+                self.optimizer = torch.optim.AdamW(
+                    trainable,
+                    lr           = self.cfg['lr'],
+                    weight_decay = self.cfg['weight_decay'],
+                )
+        else:
             self.optimizer = torch.optim.AdamW(
                 trainable,
                 lr           = self.cfg['lr'],
                 weight_decay = self.cfg['weight_decay'],
             )
-    
+
         self.scheduler = CosineAnnealingLR(
             self.optimizer,
             T_max  = self.cfg['num_steps'],
@@ -409,7 +485,7 @@ class GenerationTrainer:
         densepose    = to(batch['densepose_img'])
         fit_feats    = to(batch['fit_features'])
 
-        with torch.cuda.amp.autocast(enabled=(self.dtype == torch.float16)):
+        with torch.cuda.amp.autocast(enabled=self.use_fp16):
 
             # ── Encode GT person to latent (training target z_0) ──
             z0 = self.lat_enc.encode(person_img, sample=True)
@@ -491,8 +567,6 @@ class GenerationTrainer:
         Run DDIM inference on val set, compute SSIM/LPIPS/FID.
         Uses EMA weights for inference.
         """
-        from generation.pipeline import VTONPipeline
-
         print(f"\n  Running validation (step {self.global_step})...")
 
         # Temporarily apply EMA weights
@@ -511,7 +585,6 @@ class GenerationTrainer:
             B = batch['person_img'].shape[0]
             def to(t): return t.to(device=self.device, dtype=self.dtype)
 
-            # Prepare conditioning
             agnostic_lat = self.lat_enc.encode(to(batch['agnostic_img']),  sample=False)
             warped_lat   = self.lat_enc.encode(to(batch['warped_cloth']),   sample=False)
             cloth_lat    = self.lat_enc.encode(to(batch['cloth_clean']),    sample=False)
@@ -524,7 +597,6 @@ class GenerationTrainer:
             text_emb  = self._encode_text(batch['prompt'])
             neg_emb   = self._encode_text([''] * B)
 
-            # DDIM loop
             latents = torch.randn(B, 4, lH, lW, device=self.device, dtype=self.dtype)
             latents = latents * self.ddim_scheduler.init_noise_sigma
 
@@ -554,7 +626,6 @@ class GenerationTrainer:
             all_preds.append(preds)
             all_targets.append(batch['person_img'].float())
 
-        # Restore training weights
         self.ema.restore(all_params)
         self.unet.train()
 
@@ -621,160 +692,130 @@ class GenerationTrainer:
             t2bgr(batch['person_img'][:1]),
         ], axis=1)
 
-        # Add labels
-        import cv2 as _cv2
         for i, lbl in enumerate(['Cloth', 'Agnostic', 'Generated', 'GT']):
             x = i * (self.cfg['target_w'] + 3) + 5
-            _cv2.putText(row, lbl, (x, 20), _cv2.FONT_HERSHEY_SIMPLEX,
-                         0.6, (255,255,255), 1, _cv2.LINE_AA)
+            cv2.putText(row, lbl, (x, 20), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (255,255,255), 1, cv2.LINE_AA)
 
         path = str(self.vis_dir / f'step_{step:07d}.jpg')
         cv2.imwrite(path, row, [cv2.IMWRITE_JPEG_QUALITY, 90])
 
-    # ── Checkpoint ───────────────────────────────────────────────
+    # ── Checkpoint save (CPU-incremental + atomic write) ──────────
 
-    # def _state_dict_to_cpu(self, module_or_optimizer) -> dict:
-    #     """
-    #     Move a state_dict to CPU explicitly, tensor by tensor, rather
-    #     than letting torch.save() pull the whole thing to CPU internally
-    #     in one shot. This doesn't reduce the TOTAL bytes copied, but it
-    #     lets us free each big piece (gc.collect()) before building the
-    #     next one, so peak CPU RAM usage is closer to "one model's worth"
-    #     rather than "model + EMA + optimizer all alive on CPU at once."
-    
-    #     Handles both plain module state_dicts ({name: tensor, ...}) and
-    #     optimizer state_dicts, which have the shape:
-    #         {'state': {param_idx: {'step': tensor, 'exp_avg': tensor,
-    #                                 'exp_avg_sq': tensor}, ...},
-    #         'param_groups': [{'lr': ..., 'params': [...]}, ...]}
-    #     i.e. exactly TWO levels of nesting for 'state', and a
-    #     tensor-free 'param_groups' list — not arbitrary depth.
-    #     """
-    #     sd = module_or_optimizer.state_dict()
-    
-    #     if 'state' in sd and 'param_groups' in sd:
-    #         # Optimizer state_dict shape
-    #         cpu_state = {
-    #             param_idx: {
-    #                 k: (v.detach().cpu() if torch.is_tensor(v) else v)
-    #                 for k, v in per_param_state.items()
-    #             }
-    #             for param_idx, per_param_state in sd['state'].items()
-    #         }
-    #         return {'state': cpu_state, 'param_groups': sd['param_groups']}
-    
-    #     # Plain module state_dict shape: {name: tensor, ...}
-    #     return {
-    #         k: (v.detach().cpu() if torch.is_tensor(v) else v)
-    #         for k, v in sd.items()
-    #     }
-    
-    # def save_checkpoint(self, tag: str = ''):
-    #     import gc
-    
-    #     fname      = f'step_{self.global_step:07d}{tag}.pth'
-    #     final_path = self.out_dir / fname
-    #     tmp_path   = self.out_dir / f'{fname}.tmp'
-    
-    #     # Build the checkpoint dict INCREMENTALLY, moving each piece to
-    #     # CPU and running gc.collect() between the large ones, so we
-    #     # never hold unet + EMA + optimizer all as live CPU copies at
-    #     # once -- that simultaneous peak is what exhausted system RAM.
-    #     ckpt = {'step': self.global_step, 'config': self.cfg, 'best_ssim': self.best_ssim}
-    
-    #     ckpt['model'] = self._state_dict_to_cpu(self.unet)
-    #     gc.collect()
-    
-    #     ckpt['fit_encoder'] = self._state_dict_to_cpu(self.fit_encoder)
-    #     gc.collect()
-    
-    #     ckpt['optimizer'] = self._state_dict_to_cpu(self.optimizer)
-    #     gc.collect()
-    
-    #     ckpt['scheduler'] = self.scheduler.state_dict()   # tiny, no tensors
-    #     ckpt['scaler']    = self.scaler.state_dict()       # tiny, no tensors
-    
-    #     # EMA shadow buffers are already plain tensors (not wrapped in a
-    #     # module/optimizer), so move them directly
-    #     ema_state = self.ema.state_dict()
-    #     ckpt['ema'] = {
-    #         'decay':  ema_state['decay'],
-    #         'shadow': [s.detach().cpu() for s in ema_state['shadow']],
-    #     }
-    #     gc.collect()
-    
-    #     # Write to a temp file first, then atomically rename. If the
-    #     # process dies during torch.save() (OOM, Colab disconnect,
-    #     # manual interrupt), the .tmp file is left orphaned but the REAL
-    #     # checkpoint filename never points at a half-written file --
-    #     # this is what "the .pth was not saved completely" was actually
-    #     # describing: a crash mid-write corrupting the destination file
-    #     # directly, because the old code wrote straight to it.
-    #     try:
-    #         torch.save(ckpt, tmp_path)
-    #         os.replace(tmp_path, final_path)   # atomic on same filesystem
-    #         print(f"  Saved checkpoint: {fname}")
-    #     except Exception as e:
-    #         # Clean up the partial .tmp file so it doesn't get mistaken
-    #         # for a real checkpoint later, and re-raise -- we'd rather
-    #         # fail loudly here than leave ambiguous half-written files.
-    #         if tmp_path.exists():
-    #             tmp_path.unlink()
-    #         print(f"  ❌ Checkpoint save FAILED at step {self.global_step}: {e}")
-    #         raise
-    #     finally:
-    #         del ckpt
-    #         gc.collect()
-    
-    def save_checkpoint(self, tag: str = ''):
-        ckpt = {
-            'step':         self.global_step,
-            'model':        self.unet.state_dict(),
-            'fit_encoder':  self.fit_encoder.state_dict(),
-            'optimizer':    self.optimizer.state_dict(),
-            'scheduler':    self.scheduler.state_dict(),
-            'scaler':       self.scaler.state_dict(),
-            'ema':          self.ema.state_dict(),
-            'config':       self.cfg,
-            'best_ssim':    self.best_ssim,
+    def _state_dict_to_cpu(self, module_or_optimizer) -> dict:
+        """
+        Move a state_dict to CPU explicitly, tensor by tensor, rather
+        than letting torch.save() pull the whole thing to CPU
+        internally in one shot. This doesn't reduce the TOTAL bytes
+        copied, but it lets us free each big piece (gc.collect())
+        before building the next one, so peak CPU RAM usage during a
+        save is closer to "one component's worth" rather than
+        "unet + EMA + optimizer all alive on CPU simultaneously" —
+        the latter was confirmed to exhaust system RAM and crash the
+        runtime during a real training run.
+
+        Handles both plain module state_dicts ({name: tensor, ...})
+        and optimizer state_dicts, which have the shape:
+            {'state': {param_idx: {'step': tensor, 'exp_avg': tensor,
+                                    'exp_avg_sq': tensor}, ...},
+             'param_groups': [{'lr': ..., 'params': [...]}, ...]}
+        i.e. exactly two levels of nesting for 'state', and a
+        tensor-free 'param_groups' list — not arbitrary depth.
+        """
+        sd = module_or_optimizer.state_dict()
+
+        if 'state' in sd and 'param_groups' in sd:
+            cpu_state = {
+                param_idx: {
+                    k: (v.detach().cpu() if torch.is_tensor(v) else v)
+                    for k, v in per_param_state.items()
+                }
+                for param_idx, per_param_state in sd['state'].items()
+            }
+            return {'state': cpu_state, 'param_groups': sd['param_groups']}
+
+        return {
+            k: (v.detach().cpu() if torch.is_tensor(v) else v)
+            for k, v in sd.items()
         }
-        fname = f'step_{self.global_step:07d}{tag}.pth'
-        torch.save(ckpt, self.out_dir / fname)
-        print(f"  Saved: {fname}")
+
+    def save_checkpoint(self, tag: str = ''):
+        fname      = f'step_{self.global_step:07d}{tag}.pth'
+        final_path = self.out_dir / fname
+        tmp_path   = self.out_dir / f'{fname}.tmp'
+
+        # Build the checkpoint dict INCREMENTALLY, moving each piece
+        # to CPU and gc.collect()-ing between the large ones, so we
+        # never hold unet + EMA + optimizer all as live CPU copies
+        # simultaneously.
+        ckpt = {'step': self.global_step, 'config': self.cfg, 'best_ssim': self.best_ssim}
+
+        ckpt['model'] = self._state_dict_to_cpu(self.unet)
+        gc.collect()
+
+        ckpt['fit_encoder'] = self._state_dict_to_cpu(self.fit_encoder)
+        gc.collect()
+
+        ckpt['optimizer'] = self._state_dict_to_cpu(self.optimizer)
+        gc.collect()
+
+        ckpt['scheduler'] = self.scheduler.state_dict()   # tiny, no tensors
+        ckpt['scaler']    = self.scaler.state_dict()       # tiny, no tensors
+
+        ema_state = self.ema.state_dict()
+        ckpt['ema'] = {
+            'decay':  ema_state['decay'],
+            'shadow': [s.detach().cpu() for s in ema_state['shadow']],
+        }
+        gc.collect()
+
+        # Write to a temp file first, then atomically rename. If the
+        # process dies during torch.save() (OOM, disconnect, manual
+        # interrupt), the .tmp file is left orphaned but the REAL
+        # checkpoint filename never points at a half-written file.
+        try:
+            torch.save(ckpt, tmp_path)
+            os.replace(tmp_path, final_path)   # atomic on same filesystem
+            print(f"  Saved: {fname}")
+        except Exception as e:
+            if tmp_path.exists():
+                tmp_path.unlink()
+            print(f"  ❌ Checkpoint save FAILED at step {self.global_step}: {e}")
+            raise
+        finally:
+            del ckpt
+            gc.collect()
+
+    # ── Checkpoint load (CPU-staged, no GPU double-allocation) ────
 
     def load_checkpoint(self, path: str) -> int:
-        # Load to CPU, not GPU. torch.load with map_location='cpu' never
-        # touches the GPU during deserialization -- the whole checkpoint
-        # sits in CPU RAM first. Each load_state_dict() call below then
-        # moves ONE tensor to GPU at a time as it overwrites the live
-        # tensor, instead of torch.load materializing the ENTIRE
-        # checkpoint dict on GPU simultaneously alongside the already-live
-        # model/optimizer/EMA state. That simultaneous double-allocation
-        # is what caused the OOM on resume once the optimizer state grew
-        # past trivial size (~step 2000+).
+        # Load to CPU, not GPU. torch.load with map_location='cpu'
+        # never touches the GPU during deserialization — the whole
+        # checkpoint sits in CPU RAM first. Each load_state_dict()
+        # call below then moves ONE tensor to GPU at a time as it
+        # overwrites the live tensor, instead of torch.load
+        # materializing the ENTIRE checkpoint dict on GPU
+        # simultaneously alongside the already-live model/optimizer/
+        # EMA state — that simultaneous double-allocation was
+        # confirmed to OOM on resume once optimizer state grew past
+        # trivial size.
         ckpt = torch.load(path, map_location='cpu')
-    
+
         self.unet.load_state_dict(ckpt['model'], strict=False)
         self.fit_encoder.load_state_dict(ckpt['fit_encoder'])
         self.optimizer.load_state_dict(ckpt['optimizer'])
         self.scheduler.load_state_dict(ckpt['scheduler'])
         self.scaler.load_state_dict(ckpt['scaler'])
         self.ema.load_state_dict(ckpt['ema'])
-    
+
         self.best_ssim   = ckpt.get('best_ssim', 0.0)
         self.global_step = ckpt.get('step', 0)
-    
-        # Drop the CPU-resident checkpoint dict explicitly and clear the
-        # CUDA allocator's cached (but unused) blocks -- not strictly
-        # required since load_state_dict() already copied what it needed
-        # onto GPU tensors that own their own memory, but this keeps peak
-        # CPU RAM lower on Colab too and is good practice after a large
-        # deserialization.
+
         del ckpt
-        import gc; gc.collect()
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    
+
         print(f"Resumed from {path} | step={self.global_step}")
         return self.global_step
 
@@ -782,6 +823,11 @@ class GenerationTrainer:
 
     def run(self, resume_from: Optional[str] = None):
         if resume_from:
+            # Clear any cached-but-unused GPU memory before resuming —
+            # combined with the CPU-staged load above, this minimizes
+            # peak GPU usage during the resume transition.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             self.load_checkpoint(resume_from)
 
         print(f"\n{'='*60}")
@@ -799,7 +845,6 @@ class GenerationTrainer:
         vis_batch = None   # cache one batch for visualization
 
         while self.global_step < self.cfg['num_steps']:
-            # Cycle dataloader
             try:
                 batch = next(train_iter)
             except StopIteration:
@@ -813,7 +858,6 @@ class GenerationTrainer:
             running_loss += loss
             self.global_step += 1
 
-            # ── Periodic logging ──
             if self.global_step % log_interval == 0:
                 avg_loss = running_loss / log_interval
                 elapsed  = time.time() - t0
@@ -828,13 +872,11 @@ class GenerationTrainer:
                 )
                 running_loss = 0.0
 
-            # ── Visualization ──
             if self.global_step % self.cfg['vis_every'] == 0:
                 self.unet.eval()
                 self._save_vis(vis_batch, self.global_step)
                 self.unet.train()
 
-            # ── Validation ──
             if self.global_step % self.cfg['val_every'] == 0:
                 metrics = self._validate()
                 ssim_val = metrics.get('ssim', 0.0)
@@ -856,7 +898,6 @@ class GenerationTrainer:
                 with open(self.out_dir / 'history.json', 'w') as f:
                     json.dump(self.history, f, indent=2)
 
-            # ── Periodic save ──
             if self.global_step % self.cfg['save_every'] == 0:
                 self.save_checkpoint()
 
@@ -871,19 +912,20 @@ class GenerationTrainer:
 # ─────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--manifest',    default='preprocessed_dataset/train_manifest.json')
-    parser.add_argument('--output_dir',  default='generation/checkpoints')
-    parser.add_argument('--model_id',    default='sd-legacy/stable-diffusion-v1-5')
-    parser.add_argument('--batch_size',  type=int,   default=2)
-    parser.add_argument('--num_steps',   type=int,   default=50_000)
-    parser.add_argument('--lr',          type=float, default=1e-5)
-    parser.add_argument('--grad_ckpt',   action='store_true', default=True)
-    parser.add_argument('--fp16',        action='store_true', default=True)
-    parser.add_argument('--resume',      default=None)
-    args = parser.parse_args()
+    cli = argparse.ArgumentParser()
+    cli.add_argument('--manifest',    default=DEFAULT_CONFIG['manifest'])
+    cli.add_argument('--output_dir',  default=DEFAULT_CONFIG['output_dir'])
+    cli.add_argument('--model_id',    default=DEFAULT_CONFIG['model_id'])
+    cli.add_argument('--batch_size',  type=int,   default=2)
+    cli.add_argument('--num_steps',   type=int,   default=50_000)
+    cli.add_argument('--lr',          type=float, default=1e-5)
+    cli.add_argument('--grad_ckpt',   action='store_true', default=True)
+    cli.add_argument('--fp16',        action='store_true', default=True)
+    cli.add_argument('--use_8bit_adam', action='store_true', default=True)
+    cli.add_argument('--resume',      default=None)
+    args = cli.parse_args()
 
-    import argparse
     config = vars(args)
+    resume = config.pop('resume', None)
     trainer = GenerationTrainer(config)
-    trainer.run(resume_from=config.pop('resume', None))
+    trainer.run(resume_from=resume)
