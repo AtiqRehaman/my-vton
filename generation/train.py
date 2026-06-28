@@ -162,6 +162,13 @@ DEFAULT_CONFIG = {
     'grad_ckpt':    True,        # gradient checkpointing (MANDATORY on T4/P100)
     'xformers':     False,       # set True if xformers is installed
     'use_8bit_adam': True,       # MANDATORY in practice — see VRAM budget above
+    'frozen_device': None,       # e.g. 'cuda:1' on a Kaggle T4x2 runtime to put
+                                  # the FROZEN VAE/CLIP on the second GPU,
+                                  # freeing their memory from the main training
+                                  # device. None = same device as everything
+                                  # else (self.device). Only meaningful with 2+
+                                  # GPUs visible; harmless no-op otherwise (falls
+                                  # back to self.device with a warning).
     'ema_decay':    0.9999,
     'grad_clip':    1.0,
 
@@ -312,19 +319,50 @@ class GenerationTrainer:
         mid = self.cfg['model_id']
         print(f"Loading base model: {mid}")
 
-        # ── Frozen components: safe to load in self.dtype (fp16 on GPU) ──
+        # ── Resolve frozen_device: where VAE/CLIP actually live ──
+        # On a Kaggle T4x2 runtime, setting frozen_device='cuda:1' moves
+        # the frozen components off the main training GPU entirely,
+        # freeing their ~0.4GB (fp16) from cuda:0. This is a SMALL win
+        # for this model specifically (frozen components are tiny next
+        # to the ~860M-param UNet) but it's free headroom if a second
+        # GPU is sitting idle anyway. Falls back to self.device with a
+        # warning if the requested device doesn't actually exist.
+        requested = self.cfg.get('frozen_device')
+        if requested:
+            try:
+                idx = int(str(requested).split(':')[-1])
+                if idx < torch.cuda.device_count():
+                    self.frozen_device = torch.device(requested)
+                else:
+                    print(f"  ⚠️  frozen_device={requested} requested but only "
+                          f"{torch.cuda.device_count()} GPU(s) visible — "
+                          f"falling back to {self.device}")
+                    self.frozen_device = self.device
+            except (ValueError, IndexError):
+                print(f"  ⚠️  Could not parse frozen_device={requested!r} — "
+                      f"falling back to {self.device}")
+                self.frozen_device = self.device
+        else:
+            self.frozen_device = self.device
+
+        self.cross_device = (self.frozen_device != self.device)
+        if self.cross_device:
+            print(f"  Frozen components (VAE/CLIP) → {self.frozen_device} "
+                  f"| Trainable (UNet/optimizer) → {self.device}")
+
+        # ── Frozen components: safe to load in self.dtype (fp16) ──
         # Never touched by the optimizer/GradScaler — only forward-pass
         # inference runs through them, so fp16 here is pure savings with
         # no GradScaler interaction to worry about.
         self.vae = AutoencoderKL.from_pretrained(
             mid, subfolder='vae', torch_dtype=self.dtype
-        ).to(self.device)
+        ).to(self.frozen_device)
         for p in self.vae.parameters():
             p.requires_grad = False
 
         self.text_encoder = CLIPTextModel.from_pretrained(
             mid, subfolder='text_encoder', torch_dtype=self.dtype
-        ).to(self.device)
+        ).to(self.frozen_device)
         for p in self.text_encoder.parameters():
             p.requires_grad = False
 
@@ -339,6 +377,8 @@ class GenerationTrainer:
         # gradients" the first time backward() runs. autocast() (used in
         # _train_step) already gives fp16 forward-pass benefits on
         # activations without the weights themselves needing to be fp16.
+        # ALWAYS on self.device (the main training GPU), regardless of
+        # frozen_device — only the frozen components can be offloaded.
         self.unet = VTONUNet.from_pretrained(
             mid, torch_dtype=torch.float32, device=str(self.device)
         )
@@ -457,15 +497,25 @@ class GenerationTrainer:
 
     @torch.no_grad()
     def _encode_text(self, prompts: list) -> torch.Tensor:
-        """Encode list of prompts to CLIP embeddings. (B, 77, 768)"""
+        """
+        Encode list of prompts to CLIP embeddings. (B, 77, 768)
+
+        Routes tokens to wherever self.text_encoder actually lives
+        (self.frozen_device — which equals self.device unless a
+        separate frozen_device was configured for a dual-GPU setup),
+        then brings the result back to self.device so every call site
+        elsewhere in this file can keep using the output as if
+        everything were on one GPU.
+        """
         tokens = self.tokenizer(
             prompts,
             padding    = 'max_length',
             max_length = 77,
             truncation = True,
             return_tensors = 'pt',
-        ).input_ids.to(self.device)
-        return self.text_encoder(tokens)[0].to(self.dtype)
+        ).input_ids.to(self.frozen_device)
+        text_emb = self.text_encoder(tokens)[0]
+        return text_emb.to(device=self.device, dtype=self.dtype)
 
     # ── Single training step ─────────────────────────────────────
 
@@ -488,7 +538,7 @@ class GenerationTrainer:
         with torch.cuda.amp.autocast(enabled=self.use_fp16):
 
             # ── Encode GT person to latent (training target z_0) ──
-            z0 = self.lat_enc.encode(person_img, sample=True)
+            z0 = self.lat_enc.encode(person_img, sample=True, output_device=self.device)
 
             # ── Sample random timesteps ──
             t = torch.randint(
@@ -504,9 +554,9 @@ class GenerationTrainer:
             lH = self.cfg['target_h'] // 8
             lW = self.cfg['target_w'] // 8
 
-            agnostic_lat = self.lat_enc.encode(agnostic_img, sample=False)
-            warped_lat   = self.lat_enc.encode(warped_cloth,  sample=False)
-            cloth_lat    = self.lat_enc.encode(cloth_clean,   sample=False)
+            agnostic_lat = self.lat_enc.encode(agnostic_img, sample=False, output_device=self.device)
+            warped_lat   = self.lat_enc.encode(warped_cloth,  sample=False, output_device=self.device)
+            cloth_lat    = self.lat_enc.encode(cloth_clean,   sample=False, output_device=self.device)
 
             mask_lat     = F.interpolate(agnostic_msk, (lH, lW), mode='nearest')
             pose_lat     = F.interpolate(pose_img,     (lH, lW), mode='bilinear',
@@ -585,9 +635,9 @@ class GenerationTrainer:
             B = batch['person_img'].shape[0]
             def to(t): return t.to(device=self.device, dtype=self.dtype)
 
-            agnostic_lat = self.lat_enc.encode(to(batch['agnostic_img']),  sample=False)
-            warped_lat   = self.lat_enc.encode(to(batch['warped_cloth']),   sample=False)
-            cloth_lat    = self.lat_enc.encode(to(batch['cloth_clean']),    sample=False)
+            agnostic_lat = self.lat_enc.encode(to(batch['agnostic_img']),  sample=False, output_device=self.device)
+            warped_lat   = self.lat_enc.encode(to(batch['warped_cloth']),   sample=False, output_device=self.device)
+            cloth_lat    = self.lat_enc.encode(to(batch['cloth_clean']),    sample=False, output_device=self.device)
             fit_emb      = self.fit_encoder(to(batch['fit_features']))
             lH = self.cfg['target_h'] // 8
             lW = self.cfg['target_w'] // 8
@@ -622,7 +672,7 @@ class GenerationTrainer:
                 np_ = uncond + self.cfg['guidance_scale'] * (cond - uncond)
                 latents = self.ddim_scheduler.step(np_, t, latents).prev_sample
 
-            preds = self.lat_enc.decode(latents).float().cpu()
+            preds = self.lat_enc.decode(latents, output_device=self.device).float().cpu()
             all_preds.append(preds)
             all_targets.append(batch['person_img'].float())
 
@@ -647,9 +697,9 @@ class GenerationTrainer:
 
         lH, lW = self.cfg['target_h']//8, self.cfg['target_w']//8
 
-        agnostic_lat = self.lat_enc.encode(to(batch['agnostic_img']),  sample=False)
-        warped_lat   = self.lat_enc.encode(to(batch['warped_cloth']),   sample=False)
-        cloth_lat    = self.lat_enc.encode(to(batch['cloth_clean']),    sample=False)
+        agnostic_lat = self.lat_enc.encode(to(batch['agnostic_img']),  sample=False, output_device=self.device)
+        warped_lat   = self.lat_enc.encode(to(batch['warped_cloth']),   sample=False, output_device=self.device)
+        cloth_lat    = self.lat_enc.encode(to(batch['cloth_clean']),    sample=False, output_device=self.device)
         fit_emb      = self.fit_encoder(to(batch['fit_features']))
         mask_lat  = F.interpolate(to(batch['agnostic_mask']), (lH,lW), mode='nearest')
         pose_lat  = F.interpolate(to(batch['pose_img']),      (lH,lW), mode='bilinear', align_corners=False)
@@ -677,7 +727,7 @@ class GenerationTrainer:
             np_ = uncond + self.cfg['guidance_scale'] * (cond - uncond)
             latents = self.ddim_scheduler.step(np_, t, latents).prev_sample
 
-        pred = self.lat_enc.decode(latents)
+        pred = self.lat_enc.decode(latents, output_device=self.device)
 
         def t2bgr(t):
             t = t[0].float().clamp(-1,1)

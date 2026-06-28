@@ -1,65 +1,84 @@
 """
-fit/measurement_encoder.py — MLP that encodes body/garment measurements
-                              into a spatial fit embedding tensor for the UNet
+fit/measurement_encoder.py — Converts body/garment measurements into
+a spatial fit-conditioning embedding for the Phase 4 generation UNet.
+
+This is the bridge between Phase 3 (fit classification) and Phase 4
+(generation): the same 17-dim measurement feature vector format used
+to train the RandomForest fit classifier is reused here, but instead
+of predicting a discrete fit label, a small MLP projects it into a
+spatial tensor that gets concatenated as one of the UNet's 27 input
+channel groups (the "fit_embedding" group — 4 channels at latent
+resolution), so the diffusion model can condition its generation on
+how loose/tight the garment should appear.
 
 ─────────────────────────────────────────────────────────────────
-WHY THIS MODULE?
+17-DIM FEATURE VECTOR LAYOUT (must match across all consumers)
 ─────────────────────────────────────────────────────────────────
-The generation model (Group C) needs to know whether to generate:
-  • Tight wrinkles and visible body contours  (negative ease)
-  • Clean flat fabric                         (zero ease)
-  • Drape, folds, extra width                 (positive ease)
-  • Billowing fabric pooling at shoulders     (large positive ease)
-
-We encode this as a spatial tensor [B, 4, H/8, W/8] that gets
-concatenated into the UNet as "channel group 8" (see spec Group C).
-
-Architecture (from spec):
-  Linear(17 → 64) → GELU → Linear(64 → 128) → GELU → Linear(128 → 256)
-  Reshape(256 → 4 × 8 × 8) → Upsample to (4, latent_H, latent_W)
-
-The 17 input features are:
-  Person: chest, waist, hip, shoulder_width, height, weight   (6)
-  Garment: garment_chest, garment_waist, garment_hip,
-           garment_length, garment_shoulder                   (5)
-  Ease: ease_chest, ease_waist, ease_hip                      (3)
-  Garment type (one-hot): [upper, lower, overall]             (3)
-  Total: 17
-
-All scalar inputs are normalized to [0, 1] range before feeding in.
-The normalization ranges are set based on typical human measurements.
-
-─────────────────────────────────────────────────────────────────
+  [0]  person chest    (normalized 0-1, range 60-150 cm)
+  [1]  person waist     (normalized 0-1, range 50-140 cm)
+  [2]  person hip        (normalized 0-1, range 60-155 cm)
+  [3]  person shoulder_width (normalized 0-1, range 30-60 cm)
+  [4]  person height       (normalized 0-1, range 140-210 cm)
+  [5]  person weight        (normalized 0-1, range 40-160 kg)
+  [6]  garment_chest          (normalized 0-1, range 60-160 cm)
+  [7]  garment_waist           (normalized 0-1, range 50-150 cm)
+  [8]  garment_hip               (normalized 0-1, range 60-165 cm)
+  [9]  garment_length              (normalized 0-1, range 40-130 cm)
+  [10] garment_shoulder               (normalized 0-1, range 30-60 cm)
+  [11] ease_chest = garment_chest - person_chest (normalized, range -10..25)
+  [12] ease_waist  = garment_waist - person_waist  (normalized, range -10..22)
+  [13] ease_hip      = garment_hip - person_hip      (normalized, range -10..26)
+  [14] garment_type == 'upper'   (one-hot)
+  [15] garment_type == 'lower'   (one-hot)
+  [16] garment_type == 'overall' (one-hot)
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
-# ─────────────────────────────────────────────────────────────────
-# Feature normalization ranges (for [0,1] scaling)
-# ─────────────────────────────────────────────────────────────────
-
-MEASUREMENT_RANGES = {
-    # feature_name: (min_cm, max_cm)
+# Normalization ranges — same convention as fit/ease_calculator.py's
+# real-world cm/kg scales, kept local here since measurement_encoder
+# must work even if ease_calculator isn't imported (e.g. at inference
+# time in a stripped-down deployment image).
+RANGES = {
     'chest':            (60,  150),
     'waist':            (50,  140),
     'hip':              (60,  155),
     'shoulder_width':   (30,   60),
     'height':           (140, 210),
-    'weight':           (40,  160),    # kg
+    'weight':           (40,  160),
     'garment_chest':    (60,  160),
     'garment_waist':    (50,  150),
     'garment_hip':      (60,  165),
     'garment_length':   (40,  130),
     'garment_shoulder': (30,   60),
-    'ease_chest':       (-10,  25),    # ease range: far outside → very oversized
+    'ease_chest':       (-10,  25),
     'ease_waist':       (-10,  22),
     'ease_hip':         (-10,  26),
 }
 
 GARMENT_TYPES = ['upper', 'lower', 'overall']
+
+# Neutral default measurements — average adult body, garment with
+# moderate positive ease (lands in "Comfortable" per
+# ease_calculator.py's tolerance tables). Used whenever real
+# per-sample measurements aren't available, so Phase 4 training can
+# proceed without requiring every manifest record to carry real
+# measurement data.
+DEFAULT_PERSON = {
+    'chest': 90, 'waist': 74, 'hip': 96,
+    'shoulder_width': 40, 'height': 165, 'weight': 62,
+}
+DEFAULT_GARMENT = {
+    'garment_chest': 94, 'garment_waist': 78, 'garment_hip': 100,
+    'garment_length': 65, 'garment_shoulder': 40,
+}
+
+
+def _norm(value: float, key: str) -> float:
+    lo, hi = RANGES[key]
+    return float(max(0.0, min(1.0, (value - lo) / (hi - lo))))
 
 
 def normalize_measurements(
@@ -68,179 +87,91 @@ def normalize_measurements(
     garment_type: str = 'upper',
 ) -> torch.Tensor:
     """
-    Convert raw measurements to a normalized 17-dim float tensor.
+    Convert raw person/garment measurement dicts into the normalized
+    17-dim feature tensor described in the module docstring.
 
-    Args:
-        person_measurements:  dict with keys matching MEASUREMENT_RANGES person keys
-        garment_measurements: dict with keys matching MEASUREMENT_RANGES garment keys
-        garment_type: 'upper', 'lower', or 'overall'
-
-    Returns:
-        features: (17,) float32 tensor, values in [0, 1]
+    person_measurements keys:  chest, waist, hip, shoulder_width,
+                                height, weight
+    garment_measurements keys: garment_chest, garment_waist,
+                                garment_hip, garment_length,
+                                garment_shoulder
+    garment_type: 'upper', 'lower', or 'overall'
     """
+    p = {**DEFAULT_PERSON,  **person_measurements}
+    g = {**DEFAULT_GARMENT, **garment_measurements}
 
-    def norm(val, key):
-        lo, hi = MEASUREMENT_RANGES[key]
-        return float(max(0.0, min(1.0, (val - lo) / (hi - lo))))
+    ease_chest = g['garment_chest'] - p['chest']
+    ease_waist = g['garment_waist'] - p['waist']
+    ease_hip   = g['garment_hip']   - p['hip']
 
-    # Compute ease values
-    ease_chest = (garment_measurements.get('garment_chest', 94) -
-                  person_measurements.get('chest', 90))
-    ease_waist = (garment_measurements.get('garment_waist', 77) -
-                  person_measurements.get('waist', 74))
-    ease_hip   = (garment_measurements.get('garment_hip', 100) -
-                  person_measurements.get('hip', 96))
-
-    # Build feature vector (order must match model's expected input)
     features = [
-        # Person measurements (6)
-        norm(person_measurements.get('chest',          90),  'chest'),
-        norm(person_measurements.get('waist',          74),  'waist'),
-        norm(person_measurements.get('hip',            96),  'hip'),
-        norm(person_measurements.get('shoulder_width', 40),  'shoulder_width'),
-        norm(person_measurements.get('height',        165),  'height'),
-        norm(person_measurements.get('weight',         60),  'weight'),
-        # Garment measurements (5)
-        norm(garment_measurements.get('garment_chest',    94),  'garment_chest'),
-        norm(garment_measurements.get('garment_waist',    77),  'garment_waist'),
-        norm(garment_measurements.get('garment_hip',     100),  'garment_hip'),
-        norm(garment_measurements.get('garment_length',   65),  'garment_length'),
-        norm(garment_measurements.get('garment_shoulder', 40),  'garment_shoulder'),
-        # Ease (3)
-        norm(ease_chest, 'ease_chest'),
-        norm(ease_waist, 'ease_waist'),
-        norm(ease_hip,   'ease_hip'),
-        # Garment type one-hot (3)
+        _norm(p['chest'],            'chest'),
+        _norm(p['waist'],            'waist'),
+        _norm(p['hip'],              'hip'),
+        _norm(p['shoulder_width'],   'shoulder_width'),
+        _norm(p['height'],           'height'),
+        _norm(p['weight'],           'weight'),
+        _norm(g['garment_chest'],    'garment_chest'),
+        _norm(g['garment_waist'],    'garment_waist'),
+        _norm(g['garment_hip'],      'garment_hip'),
+        _norm(g['garment_length'],   'garment_length'),
+        _norm(g['garment_shoulder'], 'garment_shoulder'),
+        _norm(ease_chest, 'ease_chest'),
+        _norm(ease_waist, 'ease_waist'),
+        _norm(ease_hip,   'ease_hip'),
         1.0 if garment_type == 'upper'   else 0.0,
         1.0 if garment_type == 'lower'   else 0.0,
         1.0 if garment_type == 'overall' else 0.0,
     ]
-
     return torch.tensor(features, dtype=torch.float32)
 
 
-# ─────────────────────────────────────────────────────────────────
-# Measurement Encoder MLP
-# ─────────────────────────────────────────────────────────────────
+def default_measurements(garment_type: str = 'upper') -> torch.Tensor:
+    """
+    Returns the neutral fit embedding's input features (Comfortable
+    fit, average adult body) — used whenever per-sample measurements
+    aren't available in the manifest.
+    """
+    return normalize_measurements(DEFAULT_PERSON, DEFAULT_GARMENT, garment_type)
+
 
 class MeasurementEncoder(nn.Module):
     """
-    MLP that encodes 17 measurement features → spatial fit embedding.
+    Small MLP that projects the 17-dim measurement feature vector
+    into a spatial (4, latent_H, latent_W) tensor for concatenation
+    into the Phase 4 UNet's input channels.
 
-    Architecture (from spec):
-        Linear(17 → 64) → GELU → Dropout(0.1)
-        Linear(64 → 128) → GELU → Dropout(0.1)
-        Linear(128 → 256)
-        Reshape: 256 → (4, 8, 8)
-        Upsample: (4, 8, 8) → (4, latent_H, latent_W)
-
-    Where latent_H = target_H / 8, latent_W = target_W / 8
-    For 512×384: latent = 64×48
-
-    The output (B, 4, latent_H, latent_W) is concatenated into the
-    UNet input as channel group 8.
-
-    Training: jointly with the generation model (Group C).
-    Parameters: very small (~21k) — won't significantly slow training.
+    Architecture: 17 → 64 → 256 → reshape to (4, 8, 8) → upsample to
+    (4, latent_H, latent_W). Kept deliberately small — this is a
+    conditioning signal, not a heavy feature extractor — so it adds
+    negligible parameter/VRAM cost on top of the UNet fine-tune.
     """
 
-    INPUT_DIM  = 17
-    LATENT_DIM = 256   # 4 × 8 × 8
-    OUT_CH     = 4     # matches latent space channels
-
-    def __init__(
-        self,
-        target_h: int = 512,
-        target_w: int = 384,
-        dropout:  float = 0.1,
-    ):
+    def __init__(self, target_h: int = 512, target_w: int = 384):
         super().__init__()
-        # Latent spatial size (UNet operates at 1/8 of image resolution)
-        self.latent_h = target_h // 8   # 64 for 512
-        self.latent_w = target_w // 8   # 48 for 384
+        self.latent_h = target_h // 8
+        self.latent_w = target_w // 8
 
-        # MLP
-        self.mlp = nn.Sequential(
-            nn.Linear(self.INPUT_DIM, 64),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, 128),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(128, self.LATENT_DIM),
+        self.net = nn.Sequential(
+            nn.Linear(17, 64),
+            nn.SiLU(),
+            nn.Linear(64, 256),
+            nn.SiLU(),
         )
-
-        # Initialize weights: small random → model starts with near-zero
-        # fit influence, learning to use it progressively during training
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.02)
-                nn.init.zeros_(m.bias)
+        # 256 = 4 channels * 8 * 8 spatial seed, upsampled to latent res
+        self.seed_h, self.seed_w = 8, 8
+        self.seed_channels = 4
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         """
-        Args:
-            features: (B, 17) normalized measurement vector
-        Returns:
-            fit_embedding: (B, 4, latent_H, latent_W)
+        features: (B, 17) normalized measurement vector
+        returns:  (B, 4, latent_h, latent_w)
         """
         B = features.shape[0]
-
-        # MLP: (B, 17) → (B, 256)
-        x = self.mlp(features)
-
-        # Reshape to (B, 4, 8, 8) — 256 = 4×8×8
-        x = x.view(B, self.OUT_CH, 8, 8)
-
-        # Upsample to (B, 4, latent_H, latent_W)
-        # bilinear upsampling produces smoother spatial embeddings than nearest
-        x = F.interpolate(
-            x,
-            size=(self.latent_h, self.latent_w),
-            mode='bilinear',
-            align_corners=False,
+        x = self.net(features)                                    # (B, 256)
+        x = x.view(B, self.seed_channels, self.seed_h, self.seed_w)  # (B,4,8,8)
+        x = nn.functional.interpolate(
+            x, size=(self.latent_h, self.latent_w),
+            mode='bilinear', align_corners=False,
         )
-
-        return x   # (B, 4, 64, 48) for 512×384 images
-
-
-# ─────────────────────────────────────────────────────────────────
-# Default measurement factory (for inference when real measurements unavailable)
-# ─────────────────────────────────────────────────────────────────
-
-def default_measurements(garment_type: str = 'upper') -> torch.Tensor:
-    """
-    Returns a neutral fit embedding (Comfortable fit, standard proportions).
-    Used during inference when the user doesn't provide measurements.
-    """
-    person = {
-        'chest': 90, 'waist': 74, 'hip': 96,
-        'shoulder_width': 40, 'height': 165, 'weight': 62,
-    }
-    garment = {
-        'garment_chest': 94, 'garment_waist': 78, 'garment_hip': 100,
-        'garment_length': 65, 'garment_shoulder': 40,
-    }
-    return normalize_measurements(person, garment, garment_type)
-
-
-# ─────────────────────────────────────────────────────────────────
-# Sanity check
-# ─────────────────────────────────────────────────────────────────
-
-if __name__ == '__main__':
-    encoder = MeasurementEncoder(target_h=512, target_w=384)
-    total = sum(p.numel() for p in encoder.parameters())
-    print(f"MeasurementEncoder parameters: {total:,}")   # ~21k
-
-    B = 4
-    features = torch.rand(B, 17)
-    embed = encoder(features)
-    print(f"Input:  {features.shape}")    # (4, 17)
-    print(f"Output: {embed.shape}")       # (4, 4, 64, 48)
-
-    # Test with default measurements
-    default = default_measurements('upper')
-    print(f"Default features (Comfortable fit): {default.numpy().round(3)}")
-    embed_single = encoder(default.unsqueeze(0))
-    print(f"Default embedding shape: {embed_single.shape}")  # (1, 4, 64, 48)
+        return x

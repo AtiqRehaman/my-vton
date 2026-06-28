@@ -68,41 +68,74 @@ class LatentEncoder(nn.Module):
         print(f"VAE frozen | dtype={next(vae.parameters()).dtype}")
 
     @torch.no_grad()
-    def encode(self, images: torch.Tensor, sample: bool = True) -> torch.Tensor:
+    def encode(
+        self,
+        images: torch.Tensor,
+        sample: bool = True,
+        output_device=None,
+    ) -> torch.Tensor:
         """
         Encode pixel images to scaled latents.
 
         Args:
-            images: (B, 3, H, W) in [-1, 1]
+            images: (B, 3, H, W) in [-1, 1] — moved to self.vae's device
+                    automatically if it isn't already there, so callers
+                    on a different device (e.g. a cross-device training
+                    setup with frozen VAE on cuda:1) don't need to
+                    pre-route the input themselves.
             sample: if True, sample from posterior; if False, use mode
                     During training: True (adds diversity)
                     During inference: False (deterministic) or True (slight variation)
+            output_device: if set, the returned latents are moved to
+                    this device before returning. None (default) keeps
+                    the original behavior — latents stay on whatever
+                    device self.vae produced them on. Pass the
+                    TRAINING device here when self.vae lives on a
+                    separate frozen_device, so the rest of the training
+                    step doesn't need its own device-juggling.
 
         Returns:
             latents: (B, 4, H/8, W/8) scaled by VAE_SCALE_FACTOR
         """
+        vae_device = next(self.vae.parameters()).device
+        if images.device != vae_device:
+            images = images.to(vae_device)
+
         posterior = self.vae.encode(images).latent_dist
         if sample:
             latents = posterior.sample()
         else:
             latents = posterior.mode()
 
-        return latents * VAE_SCALE_FACTOR
+        latents = latents * VAE_SCALE_FACTOR
+        if output_device is not None and latents.device != torch.device(output_device):
+            latents = latents.to(output_device)
+        return latents
 
     @torch.no_grad()
-    def decode(self, latents: torch.Tensor) -> torch.Tensor:
+    def decode(self, latents: torch.Tensor, output_device=None) -> torch.Tensor:
         """
         Decode latents back to pixel images.
 
         Args:
-            latents: (B, 4, H/8, W/8) scaled latents
+            latents: (B, 4, H/8, W/8) scaled latents — moved to
+                    self.vae's device automatically if needed.
+            output_device: if set, the decoded image is moved to this
+                    device before returning. None keeps prior behavior.
 
         Returns:
             images: (B, 3, H, W) in [-1, 1]
         """
+        vae_device = next(self.vae.parameters()).device
+        if latents.device != vae_device:
+            latents = latents.to(vae_device)
+
         latents = latents / VAE_SCALE_FACTOR
         images = self.vae.decode(latents).sample
-        return images.clamp(-1, 1)
+        images = images.clamp(-1, 1)
+        if output_device is not None and images.device != torch.device(output_device):
+            images = images.to(output_device)
+        return images
 
 
 # ─────────────────────────────────────────────────────────────────
