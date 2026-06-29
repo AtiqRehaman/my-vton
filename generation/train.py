@@ -108,6 +108,8 @@ import time
 import argparse
 from pathlib import Path
 from typing import Optional
+import tempfile  
+import shutil  
 
 import torch
 import torch.nn.functional as F
@@ -115,6 +117,7 @@ from torch.utils.data import DataLoader, random_split
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import numpy as np
 from tqdm import tqdm
+from huggingface_hub import HfApi, Repository
 
 
 # Kaggle defaults — /kaggle/working is the only writable directory;
@@ -304,6 +307,48 @@ class GenerationTrainer:
         self.best_ssim    = 0.0
         self.history      = {'train_loss': [], 'val': []}
         self.metrics_calc = MetricsCalculator(str(self.device))
+        # ── Hugging Face Hub setup ──
+        self.hf_repo_id = self.cfg.get('hf_repo_id')
+        self.hf_token = self.cfg.get('hf_token')
+        self.hf_repo = None
+        
+        if self.hf_repo_id and self.hf_token:
+            try:
+                from huggingface_hub import Repository
+                # Clone/pull the repo to a local directory
+                self.hf_repo_dir = self.out_dir / 'hf_repo'
+                self.hf_repo_dir.mkdir(exist_ok=True)
+                
+                self.hf_repo = Repository(
+                    local_dir=str(self.hf_repo_dir),
+                    clone_from=self.hf_repo_id,
+                    use_auth_token=self.hf_token,
+                    repo_type="model"
+                )
+                print(f"✅ Connected to HF Hub: {self.hf_repo_id}")
+                
+                # Create checkpoints subdir if not exists
+                (self.hf_repo_dir / 'checkpoints').mkdir(exist_ok=True)
+                
+                # Load existing history if present
+                history_path = self.hf_repo_dir / 'history.json'
+                if history_path.exists():
+                    with open(history_path) as f:
+                        self.history = json.load(f)
+                        print(f"  Loaded existing history from HF Hub")
+                        
+                # Find best SSIM from history if available
+                if self.history.get('val'):
+                    self.best_ssim = max([v.get('ssim', 0) for v in self.history['val']])
+                    print(f"  Best SSIM from history: {self.best_ssim:.4f}")
+                    
+            except Exception as e:
+                print(f"⚠️ HF Hub setup failed: {e}")
+                print("  Will save locally only")
+                self.hf_repo = None
+        else:
+            print("ℹ️ HF Hub not configured - saving locally only")
+            self.hf_repo = None
 
     # ── Model loading ────────────────────────────────────────────
 
@@ -839,14 +884,11 @@ class GenerationTrainer:
         }
 
     def save_checkpoint(self, tag: str = ''):
-        fname      = f'step_{self.global_step:07d}{tag}.pth'
+        fname = f'step_{self.global_step:07d}{tag}.pth'
         final_path = self.out_dir / fname
-        tmp_path   = self.out_dir / f'{fname}.tmp'
+        tmp_path = self.out_dir / f'{fname}.tmp'
 
-        # Build the checkpoint dict INCREMENTALLY, moving each piece
-        # to CPU and gc.collect()-ing between the large ones, so we
-        # never hold unet + EMA + optimizer all as live CPU copies
-        # simultaneously.
+        # Build the checkpoint dict INCREMENTALLY
         ckpt = {'step': self.global_step, 'config': self.cfg, 'best_ssim': self.best_ssim}
 
         ckpt['model'] = self._state_dict_to_cpu(self.unet)
@@ -858,24 +900,50 @@ class GenerationTrainer:
         ckpt['optimizer'] = self._state_dict_to_cpu(self.optimizer)
         gc.collect()
 
-        ckpt['scheduler'] = self.scheduler.state_dict()   # tiny, no tensors
-        ckpt['scaler']    = self.scaler.state_dict()       # tiny, no tensors
+        ckpt['scheduler'] = self.scheduler.state_dict()
+        ckpt['scaler'] = self.scaler.state_dict()
 
         ema_state = self.ema.state_dict()
         ckpt['ema'] = {
-            'decay':  ema_state['decay'],
+            'decay': ema_state['decay'],
             'shadow': [s.detach().cpu() for s in ema_state['shadow']],
         }
         gc.collect()
 
-        # Write to a temp file first, then atomically rename. If the
-        # process dies during torch.save() (OOM, disconnect, manual
-        # interrupt), the .tmp file is left orphaned but the REAL
-        # checkpoint filename never points at a half-written file.
+        # Save to local temp then rename
         try:
             torch.save(ckpt, tmp_path)
-            os.replace(tmp_path, final_path)   # atomic on same filesystem
+            os.replace(tmp_path, final_path)
             print(f"  Saved: {fname}")
+            
+            # ── Upload to HF Hub if configured ──
+            if self.hf_repo is not None:
+                try:
+                    import shutil
+                    # Copy checkpoint to HF repo directory
+                    hf_ckpt_path = self.hf_repo_dir / 'checkpoints' / fname
+                    shutil.copy2(final_path, hf_ckpt_path)
+                    
+                    # Copy latest checkpoint symlink (optional)
+                    latest_symlink = self.hf_repo_dir / 'checkpoints' / 'latest.pth'
+                    if latest_symlink.exists() or latest_symlink.is_symlink():
+                        latest_symlink.unlink()
+                    latest_symlink.symlink_to(fname)
+                    
+                    # Save history
+                    with open(self.hf_repo_dir / 'history.json', 'w') as f:
+                        json.dump(self.history, f, indent=2)
+                    
+                    # Push to Hub
+                    self.hf_repo.push_to_hub(
+                        commit_message=f"Checkpoint step {self.global_step}{tag}",
+                        blocking=False,  # Non-blocking to not slow training
+                    )
+                    print(f"  📤 Pushed to HF Hub: {self.hf_repo_id}")
+                    
+                except Exception as e:
+                    print(f"  ⚠️ Failed to upload to HF Hub: {e}")
+                    
         except Exception as e:
             if tmp_path.exists():
                 tmp_path.unlink()
@@ -884,7 +952,7 @@ class GenerationTrainer:
         finally:
             del ckpt
             gc.collect()
-
+            
     # ── Checkpoint load (CPU-staged, no GPU double-allocation) ────
 
     def load_checkpoint(self, path: str) -> int:
@@ -917,10 +985,43 @@ class GenerationTrainer:
 
         print(f"Resumed from {path} | step={self.global_step}")
         return self.global_step
+    
+    def load_checkpoint_from_hf(self, step: Optional[int] = None, tag: str = ''):
+        """
+        Load checkpoint from HF Hub. If step is None, loads the latest checkpoint.
+        """
+        if self.hf_repo is None:
+            raise ValueError("HF Hub not configured. Set hf_repo_id and hf_token.")
+        
+        # Pull latest changes
+        self.hf_repo.git_pull()
+        
+        checkpoints_dir = self.hf_repo_dir / 'checkpoints'
+        
+        if step is not None:
+            fname = f'step_{step:07d}{tag}.pth'
+        else:
+            # Find latest checkpoint
+            latest_symlink = checkpoints_dir / 'latest.pth'
+            if not latest_symlink.exists():
+                # Find by step number
+                ckpts = list(checkpoints_dir.glob('step_*.pth'))
+                if not ckpts:
+                    raise FileNotFoundError("No checkpoints found in HF repo")
+                latest = max(ckpts, key=lambda p: int(p.stem.split('_')[1]))
+                fname = latest.name
+            else:
+                fname = latest_symlink.readlink().name
+        
+        ckpt_path = checkpoints_dir / fname
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Checkpoint {fname} not found in HF repo")
+        
+        return self.load_checkpoint(str(ckpt_path))
 
     # ── Main training loop ────────────────────────────────────────
 
-    def run(self, resume_from: Optional[str] = None):
+    def run(self, resume_from: Optional[str] = None, resume_from_hf: bool = False):
         if resume_from:
             # Clear any cached-but-unused GPU memory before resuming —
             # combined with the CPU-staged load above, this minimizes
@@ -928,6 +1029,11 @@ class GenerationTrainer:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             self.load_checkpoint(resume_from)
+            
+        elif resume_from_hf and self.hf_repo is not None:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            self.load_checkpoint_from_hf()
 
         print(f"\n{'='*60}")
         print(f"Generation model training | {self.cfg['num_steps']} steps")
@@ -1023,6 +1129,9 @@ if __name__ == '__main__':
     cli.add_argument('--fp16',        action='store_true', default=True)
     cli.add_argument('--use_8bit_adam', action='store_true', default=True)
     cli.add_argument('--resume',      default=None)
+    cli.add_argument('--hf_repo_id', default=None, help='HF Hub repo ID (e.g., username/repo)')
+    cli.add_argument('--hf_token', default=None, help='HF Hub token')
+    cli.add_argument('--resume_from_hf', action='store_true', help='Resume from HF Hub latest checkpoint')
     args = cli.parse_args()
 
     config = vars(args)
