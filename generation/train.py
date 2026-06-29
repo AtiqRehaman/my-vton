@@ -526,6 +526,21 @@ class GenerationTrainer:
         def to(t):
             return t.to(device=self.device, dtype=self.dtype)
 
+        # fit_encoder is a TRAINABLE component, kept deliberately fp32
+        # always (see _load_models() — required for GradScaler to work
+        # on its gradients). Its input must therefore also be fp32,
+        # never self.dtype. Earlier reasoning assumed autocast() would
+        # transparently bridge a fp16 input into fp32-weighted layers
+        # inside the context below — that assumption was WRONG and
+        # caused a real crash ("expected mat1 and mat2 to have the
+        # same dtype, but got: c10::Half != float") after the same fix
+        # had already been applied to _validate()/_save_vis() but not
+        # here. Do not move fit_feats back to to() — autocast does not
+        # reliably rescue a fp32-weight/fp16-input mismatch for
+        # nn.Linear in all cases.
+        def to_fp32(t):
+            return t.to(device=self.device, dtype=torch.float32)
+
         person_img   = to(batch['person_img'])
         agnostic_img = to(batch['agnostic_img'])
         agnostic_msk = to(batch['agnostic_mask'])
@@ -533,7 +548,7 @@ class GenerationTrainer:
         cloth_clean  = to(batch['cloth_clean'])
         pose_img     = to(batch['pose_img'])
         densepose    = to(batch['densepose_img'])
-        fit_feats    = to(batch['fit_features'])
+        fit_feats    = to_fp32(batch['fit_features'])
 
         with torch.cuda.amp.autocast(enabled=self.use_fp16):
 
@@ -562,7 +577,17 @@ class GenerationTrainer:
             pose_lat     = F.interpolate(pose_img,     (lH, lW), mode='bilinear',
                                           align_corners=False)
             dense_lat    = F.interpolate(densepose,    (lH, lW), mode='nearest')
-            fit_emb      = self.fit_encoder(fit_feats)
+            # fit_encoder's weights are fp32 (trainable component), so
+            # its output is fp32 regardless of autocast. But the UNet
+            # concatenates all 8 channel groups together (see
+            # unet_modified.py forward()), and torch.cat silently
+            # upcasts the WHOLE result to fp32 if even one input is
+            # fp32 — that doesn't crash, but it defeats fp16 autocast's
+            # memory/speed benefit for the entire UNet forward pass
+            # without any visible error. Cast fit_emb to match
+            # z_t's dtype (whatever autocast actually produced for the
+            # other tensors) right before the concat, not earlier.
+            fit_emb = self.fit_encoder(fit_feats).to(z_t.dtype)
 
             # ── Text conditioning with 10% null dropout ──
             prompts = batch['prompt']
@@ -646,7 +671,14 @@ class GenerationTrainer:
             agnostic_lat = self.lat_enc.encode(to(batch['agnostic_img']),  sample=False, output_device=self.device)
             warped_lat   = self.lat_enc.encode(to(batch['warped_cloth']),   sample=False, output_device=self.device)
             cloth_lat    = self.lat_enc.encode(to(batch['cloth_clean']),    sample=False, output_device=self.device)
-            fit_emb      = self.fit_encoder(to_fp32(batch['fit_features']))
+            # fit_encoder's weights are fp32, so its raw output is
+            # fp32 regardless of self.dtype. The UNet concatenates all
+            # 8 channel groups (unet_modified.py forward()), and
+            # torch.cat silently upcasts the WHOLE result to fp32 if
+            # even one input is fp32 — no error, but it defeats fp16
+            # for the entire UNet forward pass here. Cast to self.dtype
+            # to match every other tensor in this loop.
+            fit_emb      = self.fit_encoder(to_fp32(batch['fit_features'])).to(self.dtype)
             lH = self.cfg['target_h'] // 8
             lW = self.cfg['target_w'] // 8
             mask_lat  = F.interpolate(to(batch['agnostic_mask']), (lH,lW), mode='nearest')
@@ -715,7 +747,9 @@ class GenerationTrainer:
         agnostic_lat = self.lat_enc.encode(to(batch['agnostic_img']),  sample=False, output_device=self.device)
         warped_lat   = self.lat_enc.encode(to(batch['warped_cloth']),   sample=False, output_device=self.device)
         cloth_lat    = self.lat_enc.encode(to(batch['cloth_clean']),    sample=False, output_device=self.device)
-        fit_emb      = self.fit_encoder(to_fp32(batch['fit_features']))
+        # Same upcast risk as _train_step/_validate — cast to self.dtype
+        # to match the other tensors feeding into the unet concat.
+        fit_emb      = self.fit_encoder(to_fp32(batch['fit_features'])).to(self.dtype)
         mask_lat  = F.interpolate(to(batch['agnostic_mask']), (lH,lW), mode='nearest')
         pose_lat  = F.interpolate(to(batch['pose_img']),      (lH,lW), mode='bilinear', align_corners=False)
         dense_lat = F.interpolate(to(batch['densepose_img']), (lH,lW), mode='nearest')
@@ -977,6 +1011,7 @@ class GenerationTrainer:
 # ─────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
+    print("Welcome to new trainer")
     cli = argparse.ArgumentParser()
     cli.add_argument('--manifest',    default=DEFAULT_CONFIG['manifest'])
     cli.add_argument('--output_dir',  default=DEFAULT_CONFIG['output_dir'])
