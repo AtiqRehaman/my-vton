@@ -118,7 +118,6 @@ from torch.utils.data import DataLoader, random_split
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import numpy as np
 from tqdm import tqdm
-from huggingface_hub import HfApi, Repository
 from huggingface_hub import HfApi, upload_file, list_repo_files, hf_hub_download
 
 
@@ -310,49 +309,34 @@ class GenerationTrainer:
         self.history      = {'train_loss': [], 'val': []}
         self.metrics_calc = MetricsCalculator(str(self.device))
         
-        
-        # ── Hugging Face Hub setup ──
+        # ── Hugging Face Hub setup (HTTP API only - NO CLONING) ──
         self.hf_repo_id = self.cfg.get('hf_repo_id')
         self.hf_token = self.cfg.get('hf_token')
-        self.hf_repo = None
+        self.hf_api = None
         
         if self.hf_repo_id and self.hf_token:
             try:
-                from huggingface_hub import Repository
-                # Clone/pull the repo to a local directory
-                self.hf_repo_dir = self.out_dir / 'hf_repo'
-                self.hf_repo_dir.mkdir(exist_ok=True)
+                from huggingface_hub import HfApi
+                self.hf_api = HfApi()
+                print(f"✅ Connected to HF Hub (HTTP API): {self.hf_repo_id}")
                 
-                self.hf_repo = Repository(
-                    local_dir=str(self.hf_repo_dir),
-                    clone_from=self.hf_repo_id,
-                    use_auth_token=self.hf_token,
-                    repo_type="model"
-                )
-                print(f"✅ Connected to HF Hub: {self.hf_repo_id}")
-                
-                # Create checkpoints subdir if not exists
-                (self.hf_repo_dir / 'checkpoints').mkdir(exist_ok=True)
-                
-                # Load existing history if present
-                history_path = self.hf_repo_dir / 'history.json'
+                # Try to load local history if exists
+                history_path = self.out_dir / 'history.json'
                 if history_path.exists():
                     with open(history_path) as f:
                         self.history = json.load(f)
-                        print(f"  Loaded existing history from HF Hub")
+                        print(f"  Loaded existing local history")
                         
-                # Find best SSIM from history if available
-                if self.history.get('val'):
-                    self.best_ssim = max([v.get('ssim', 0) for v in self.history['val']])
-                    print(f"  Best SSIM from history: {self.best_ssim:.4f}")
+                        # Find best SSIM from history
+                        if self.history.get('val'):
+                            self.best_ssim = max([v.get('ssim', 0) for v in self.history['val']])
+                            print(f"  Best SSIM from history: {self.best_ssim:.4f}")
                     
             except Exception as e:
                 print(f"⚠️ HF Hub setup failed: {e}")
-                print("  Will save locally only")
-                self.hf_repo = None
+                self.hf_api = None
         else:
             print("ℹ️ HF Hub not configured - saving locally only")
-            self.hf_repo = None
 
     # ── Model loading ────────────────────────────────────────────
 
@@ -968,6 +952,57 @@ class GenerationTrainer:
             del ckpt
             gc.collect()
             
+    
+    def download_latest_from_hf(self) -> Optional[str]:
+        """
+        Download the latest checkpoint from HF Hub to local directory.
+        Returns the path to the downloaded checkpoint.
+        """
+        if self.hf_api is None or not self.hf_repo_id:
+            print("⚠️ HF Hub not configured")
+            return None
+        
+        try:
+            # Download latest.txt from HF to get the latest checkpoint name
+            from huggingface_hub import hf_hub_download
+            
+            print("📥 Fetching latest checkpoint info from HF...")
+            latest_path = hf_hub_download(
+                repo_id=self.hf_repo_id,
+                filename="checkpoints/latest.txt",
+                token=self.hf_token,
+                local_dir=self.out_dir / 'temp',
+            )
+            
+            with open(latest_path, 'r') as f:
+                fname = f.read().strip()
+            
+            print(f"📥 Downloading checkpoint: {fname}")
+            
+            # Download the checkpoint
+            ckpt_path = hf_hub_download(
+                repo_id=self.hf_repo_id,
+                filename=f"checkpoints/{fname}",
+                token=self.hf_token,
+                local_dir=self.out_dir / 'temp',
+            )
+            
+            # Copy to main checkpoint directory
+            import shutil
+            final_path = self.out_dir / fname
+            shutil.copy2(ckpt_path, final_path)
+            
+            # Update latest.txt locally
+            with open(self.out_dir / 'latest.txt', 'w') as f:
+                f.write(fname)
+            
+            print(f"✅ Downloaded latest checkpoint: {final_path}")
+            return str(final_path)
+        
+        except Exception as e:
+            print(f"⚠️ Failed to download from HF: {e}")
+            return None
+            
     def _keep_only_latest_checkpoint(self):
         """Delete all old local checkpoints, keep only the latest."""
         try:
@@ -1061,18 +1096,56 @@ class GenerationTrainer:
         # Load the checkpoint
         return self.load_checkpoint(ckpt_path)
     
-    def get_latest_checkpoint(self):
+    def get_latest_checkpoint(self) -> Optional[str]:
         """Get the path to the latest local checkpoint."""
         latest_file = self.out_dir / 'latest.txt'
         if latest_file.exists():
             with open(latest_file, 'r') as f:
                 fname = f.read().strip()
-            return str(self.out_dir / fname)
+            path = self.out_dir / fname
+            if path.exists():
+                return str(path)
         return None
+    
+    
+    def resume_or_start(self):
+        """
+        Automatically resume from the latest checkpoint (local or HF).
+        """
+        # First check if we have a local checkpoint
+        latest_local = self.out_dir / 'latest.txt'
+        if latest_local.exists():
+            with open(latest_local, 'r') as f:
+                fname = f.read().strip()
+            local_path = self.out_dir / fname
+            if local_path.exists():
+                print(f"✅ Found local checkpoint: {fname}")
+                return self.run(resume_from=str(local_path))
+        
+        # If no local checkpoint, try HF Hub
+        if self.hf_api is not None and self.hf_repo_id:
+            print("🔄 No local checkpoint found, trying HF Hub...")
+            try:
+                # Check if there's a checkpoint on HF
+                from huggingface_hub import list_repo_files
+                files = list_repo_files(self.hf_repo_id, token=self.hf_token)
+                checkpoints = [f for f in files if f.startswith('checkpoints/step_') and f.endswith('.pth')]
+                
+                if checkpoints:
+                    print(f"📥 Found {len(checkpoints)} checkpoints on HF")
+                    ckpt_path = self.download_latest_from_hf()
+                    if ckpt_path:
+                        return self.run(resume_from=ckpt_path)
+            except Exception as e:
+                print(f"⚠️ Could not check HF: {e}")
+        
+        # No checkpoint found anywhere, start fresh
+        print("🆕 No checkpoint found - Starting fresh training")
+        return self.run()
 
     # ── Main training loop ────────────────────────────────────────
 
-    def run(self, resume_from: Optional[str] = None, resume_from_hf: bool = False):
+    def run(self, resume_from: Optional[str] = None):
         if resume_from:
             # Clear any cached-but-unused GPU memory before resuming —
             # combined with the CPU-staged load above, this minimizes
@@ -1081,10 +1154,10 @@ class GenerationTrainer:
                 torch.cuda.empty_cache()
             self.load_checkpoint(resume_from)
             
-        elif resume_from_hf and self.hf_repo is not None:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            self.load_checkpoint_from_hf()
+        # elif resume_from_hf and self.hf_repo is not None:
+        #     if torch.cuda.is_available():
+        #         torch.cuda.empty_cache()
+        #     self.load_checkpoint_from_hf()
 
         print(f"\n{'='*60}")
         print(f"Generation model training | {self.cfg['num_steps']} steps")
@@ -1187,5 +1260,11 @@ if __name__ == '__main__':
 
     config = vars(args)
     resume = config.pop('resume', None)
+    auto_resume = config.pop('auto_resume', False)
     trainer = GenerationTrainer(config)
-    trainer.run(resume_from=resume)
+    if auto_resume:
+        history = trainer.resume_or_start()
+    elif resume:
+        history = trainer.run(resume_from=resume)
+    else:
+        history = trainer.run()
