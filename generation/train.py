@@ -101,6 +101,7 @@ VRAM BUDGET (T4-class, ~15 GB, fp32 trainable + fp16 frozen + AdamW8bit)
 ─────────────────────────────────────────────────────────────────
 """
 
+import io
 import os
 import gc
 import json
@@ -118,6 +119,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 import numpy as np
 from tqdm import tqdm
 from huggingface_hub import HfApi, Repository
+from huggingface_hub import HfApi, upload_file, list_repo_files, hf_hub_download
 
 
 # Kaggle defaults — /kaggle/working is the only writable directory;
@@ -307,6 +309,8 @@ class GenerationTrainer:
         self.best_ssim    = 0.0
         self.history      = {'train_loss': [], 'val': []}
         self.metrics_calc = MetricsCalculator(str(self.device))
+        
+        
         # ── Hugging Face Hub setup ──
         self.hf_repo_id = self.cfg.get('hf_repo_id')
         self.hf_token = self.cfg.get('hf_token')
@@ -888,21 +892,16 @@ class GenerationTrainer:
         final_path = self.out_dir / fname
         tmp_path = self.out_dir / f'{fname}.tmp'
 
-        # Build the checkpoint dict INCREMENTALLY
+        # Build the checkpoint dict (same as before)
         ckpt = {'step': self.global_step, 'config': self.cfg, 'best_ssim': self.best_ssim}
-
         ckpt['model'] = self._state_dict_to_cpu(self.unet)
         gc.collect()
-
         ckpt['fit_encoder'] = self._state_dict_to_cpu(self.fit_encoder)
         gc.collect()
-
         ckpt['optimizer'] = self._state_dict_to_cpu(self.optimizer)
         gc.collect()
-
         ckpt['scheduler'] = self.scheduler.state_dict()
         ckpt['scaler'] = self.scaler.state_dict()
-
         ema_state = self.ema.state_dict()
         ckpt['ema'] = {
             'decay': ema_state['decay'],
@@ -910,39 +909,55 @@ class GenerationTrainer:
         }
         gc.collect()
 
-        # Save to local temp then rename
         try:
+            # Save locally first
             torch.save(ckpt, tmp_path)
             os.replace(tmp_path, final_path)
-            print(f"  Saved: {fname}")
-            
-            # ── Upload to HF Hub if configured ──
-            if self.hf_repo is not None:
+            print(f"  ✅ Saved locally: {fname} ({final_path.stat().st_size / 1e9:.2f} GB)")
+
+            # ── Upload to HF Hub via HTTP API ──
+            if self.hf_api is not None and self.hf_repo_id:
                 try:
-                    import shutil
-                    # Copy checkpoint to HF repo directory
-                    hf_ckpt_path = self.hf_repo_dir / 'checkpoints' / fname
-                    shutil.copy2(final_path, hf_ckpt_path)
+                    # Upload checkpoint file
+                    hf_path = f"checkpoints/{fname}"
+                    print(f"  📤 Uploading to HF Hub: {hf_path} ...")
                     
-                    # Copy latest checkpoint symlink (optional)
-                    latest_symlink = self.hf_repo_dir / 'checkpoints' / 'latest.pth'
-                    if latest_symlink.exists() or latest_symlink.is_symlink():
-                        latest_symlink.unlink()
-                    latest_symlink.symlink_to(fname)
-                    
-                    # Save history
-                    with open(self.hf_repo_dir / 'history.json', 'w') as f:
-                        json.dump(self.history, f, indent=2)
-                    
-                    # Push to Hub
-                    self.hf_repo.push_to_hub(
-                        commit_message=f"Checkpoint step {self.global_step}{tag}",
-                        blocking=False,  # Non-blocking to not slow training
+                    upload_file(
+                        path_or_fileobj=str(final_path),
+                        path_in_repo=hf_path,
+                        repo_id=self.hf_repo_id,
+                        token=self.hf_token,
                     )
-                    print(f"  📤 Pushed to HF Hub: {self.hf_repo_id}")
+                    print(f"  ✅ Uploaded to HF Hub: {hf_path}")
+                    
+                    # Upload latest.txt (to track latest checkpoint)
+                    latest_content = fname.encode('utf-8')
+                    latest_bytes = io.BytesIO(latest_content)
+                    upload_file(
+                        path_or_fileobj=latest_bytes,
+                        path_in_repo="checkpoints/latest.txt",
+                        repo_id=self.hf_repo_id,
+                        token=self.hf_token,
+                    )
+                    
+                    # Upload history.json
+                    history_json = json.dumps(self.history, indent=2).encode('utf-8')
+                    history_bytes = io.BytesIO(history_json)
+                    upload_file(
+                        path_or_fileobj=history_bytes,
+                        path_in_repo="history.json",
+                        repo_id=self.hf_repo_id,
+                        token=self.hf_token,
+                    )
+                    
+                    print(f"  ✅ Pushed all files to HF Hub: {self.hf_repo_id}")
+                    
+                    # ── Clean up: Delete old local checkpoints, keep only latest ──
+                    self._keep_only_latest_checkpoint()
                     
                 except Exception as e:
                     print(f"  ⚠️ Failed to upload to HF Hub: {e}")
+                    # Keep the local checkpoint if upload failed
                     
         except Exception as e:
             if tmp_path.exists():
@@ -953,6 +968,32 @@ class GenerationTrainer:
             del ckpt
             gc.collect()
             
+    def _keep_only_latest_checkpoint(self):
+        """Delete all old local checkpoints, keep only the latest."""
+        try:
+            ckpt_files = sorted(
+                [p for p in self.out_dir.glob('step_*.pth') if not p.is_symlink()],
+                key=lambda p: int(p.stem.split('_')[1])
+            )
+            
+            # Keep only the latest checkpoint
+            if len(ckpt_files) > 1:
+                for old_ckpt in ckpt_files[:-1]:  # Delete all except the newest
+                    try:
+                        old_ckpt.unlink()
+                        print(f"  🗑️ Deleted old local: {old_ckpt.name}")
+                    except Exception as e:
+                        print(f"  ⚠️ Could not delete {old_ckpt.name}: {e}")
+            
+            # Update local latest.txt
+            if ckpt_files:
+                with open(self.out_dir / 'latest.txt', 'w') as f:
+                    f.write(ckpt_files[-1].name)
+                print(f"  📝 Local latest: {ckpt_files[-1].name}")
+                
+        except Exception as e:
+            print(f"  ⚠️ Could not clean up old checkpoints: {e}")
+                    
     # ── Checkpoint load (CPU-staged, no GPU double-allocation) ────
 
     def load_checkpoint(self, path: str) -> int:
@@ -986,38 +1027,48 @@ class GenerationTrainer:
         print(f"Resumed from {path} | step={self.global_step}")
         return self.global_step
     
-    def load_checkpoint_from_hf(self, step: Optional[int] = None, tag: str = ''):
+    def load_checkpoint_from_hf(self, step: Optional[int] = None):
         """
-        Load checkpoint from HF Hub. If step is None, loads the latest checkpoint.
+        Load a specific checkpoint from HF Hub without downloading everything.
         """
-        if self.hf_repo is None:
-            raise ValueError("HF Hub not configured. Set hf_repo_id and hf_token.")
+        if self.hf_api is None or not self.hf_repo_id:
+            raise ValueError("HF Hub not configured")
         
-        # Pull latest changes
-        self.hf_repo.git_pull()
+        # Get the latest checkpoint name from HF
+        if step is None:
+            # Download the latest.txt file from HF
+            latest_path = hf_hub_download(
+                repo_id=self.hf_repo_id,
+                filename="checkpoints/latest.txt",
+                token=self.hf_token,
+                local_dir=self.out_dir / 'temp',
+            )
+            with open(latest_path, 'r') as f:
+                fname = f.read().strip()
+            step = int(fname.split('_')[1])  # Extract step number
         
-        checkpoints_dir = self.hf_repo_dir / 'checkpoints'
+        # Download the specific checkpoint
+        ckpt_name = f'step_{step:07d}.pth' if step else fname
+        print(f"📥 Downloading checkpoint from HF: {ckpt_name}")
         
-        if step is not None:
-            fname = f'step_{step:07d}{tag}.pth'
-        else:
-            # Find latest checkpoint
-            latest_symlink = checkpoints_dir / 'latest.pth'
-            if not latest_symlink.exists():
-                # Find by step number
-                ckpts = list(checkpoints_dir.glob('step_*.pth'))
-                if not ckpts:
-                    raise FileNotFoundError("No checkpoints found in HF repo")
-                latest = max(ckpts, key=lambda p: int(p.stem.split('_')[1]))
-                fname = latest.name
-            else:
-                fname = latest_symlink.readlink().name
+        ckpt_path = hf_hub_download(
+            repo_id=self.hf_repo_id,
+            filename=f"checkpoints/{ckpt_name}",
+            token=self.hf_token,
+            local_dir=self.out_dir / 'temp',
+        )
         
-        ckpt_path = checkpoints_dir / fname
-        if not ckpt_path.exists():
-            raise FileNotFoundError(f"Checkpoint {fname} not found in HF repo")
-        
-        return self.load_checkpoint(str(ckpt_path))
+        # Load the checkpoint
+        return self.load_checkpoint(ckpt_path)
+    
+    def get_latest_checkpoint(self):
+        """Get the path to the latest local checkpoint."""
+        latest_file = self.out_dir / 'latest.txt'
+        if latest_file.exists():
+            with open(latest_file, 'r') as f:
+                fname = f.read().strip()
+            return str(self.out_dir / fname)
+        return None
 
     # ── Main training loop ────────────────────────────────────────
 
