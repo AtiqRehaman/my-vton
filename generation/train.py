@@ -634,11 +634,19 @@ class GenerationTrainer:
         for batch in tqdm(self.val_loader, desc='  val', leave=False):
             B = batch['person_img'].shape[0]
             def to(t): return t.to(device=self.device, dtype=self.dtype)
+            # fit_encoder is deliberately kept fp32 (it's a TRAINABLE
+            # component — see _load_models()), so its input must also
+            # be fp32, not self.dtype (which is fp16 when fp16=True).
+            # Using to() here would feed a fp16 tensor into fp32
+            # nn.Linear layers and raise "mat1 and mat2 must have the
+            # same dtype" — confirmed by a real crash during _save_vis,
+            # which has the identical pattern (see below).
+            def to_fp32(t): return t.to(device=self.device, dtype=torch.float32)
 
             agnostic_lat = self.lat_enc.encode(to(batch['agnostic_img']),  sample=False, output_device=self.device)
             warped_lat   = self.lat_enc.encode(to(batch['warped_cloth']),   sample=False, output_device=self.device)
             cloth_lat    = self.lat_enc.encode(to(batch['cloth_clean']),    sample=False, output_device=self.device)
-            fit_emb      = self.fit_encoder(to(batch['fit_features']))
+            fit_emb      = self.fit_encoder(to_fp32(batch['fit_features']))
             lH = self.cfg['target_h'] // 8
             lW = self.cfg['target_w'] // 8
             mask_lat  = F.interpolate(to(batch['agnostic_mask']), (lH,lW), mode='nearest')
@@ -694,13 +702,20 @@ class GenerationTrainer:
 
         B = 1
         def to(t): return t[:B].to(device=self.device, dtype=self.dtype)
+        # Same fp32 requirement as _validate() — fit_encoder is a
+        # TRAINABLE component kept deliberately fp32, so its input
+        # can't go through the fp16 to() helper used for everything
+        # else here. This is the exact line that crashed:
+        # "RuntimeError: mat1 and mat2 must have the same dtype, but
+        # got Half and Float" at step 250 via vis_every.
+        def to_fp32(t): return t[:B].to(device=self.device, dtype=torch.float32)
 
         lH, lW = self.cfg['target_h']//8, self.cfg['target_w']//8
 
         agnostic_lat = self.lat_enc.encode(to(batch['agnostic_img']),  sample=False, output_device=self.device)
         warped_lat   = self.lat_enc.encode(to(batch['warped_cloth']),   sample=False, output_device=self.device)
         cloth_lat    = self.lat_enc.encode(to(batch['cloth_clean']),    sample=False, output_device=self.device)
-        fit_emb      = self.fit_encoder(to(batch['fit_features']))
+        fit_emb      = self.fit_encoder(to_fp32(batch['fit_features']))
         mask_lat  = F.interpolate(to(batch['agnostic_mask']), (lH,lW), mode='nearest')
         pose_lat  = F.interpolate(to(batch['pose_img']),      (lH,lW), mode='bilinear', align_corners=False)
         dense_lat = F.interpolate(to(batch['densepose_img']), (lH,lW), mode='nearest')
