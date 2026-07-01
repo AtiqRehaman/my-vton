@@ -963,15 +963,18 @@ class GenerationTrainer:
             return None
         
         try:
-            # Download latest.txt from HF to get the latest checkpoint name
             from huggingface_hub import hf_hub_download
+            import shutil
             
             print("📥 Fetching latest checkpoint info from HF...")
+            
+            # Download latest.txt to a temp file (not in a nested folder)
             latest_path = hf_hub_download(
                 repo_id=self.hf_repo_id,
                 filename="checkpoints/latest.txt",
                 token=self.hf_token,
-                local_dir=self.out_dir / 'temp',
+                local_dir=self.out_dir,  # ← Download directly to out_dir
+                local_files_only=False,
             )
             
             with open(latest_path, 'r') as f:
@@ -979,26 +982,39 @@ class GenerationTrainer:
             
             print(f"📥 Downloading checkpoint: {fname}")
             
-            # Download the checkpoint
+            # Download the checkpoint directly to out_dir
             ckpt_path = hf_hub_download(
                 repo_id=self.hf_repo_id,
                 filename=f"checkpoints/{fname}",
                 token=self.hf_token,
-                local_dir=self.out_dir / 'temp',
+                local_dir=self.out_dir,  # ← Download directly to out_dir
+                local_files_only=False,
             )
             
-            # Copy to main checkpoint directory
-            import shutil
+            # The file will be at: self.out_dir / 'checkpoints' / fname
+            # Move it to the main directory
+            downloaded_path = self.out_dir / 'checkpoints' / fname
             final_path = self.out_dir / fname
-            shutil.copy2(ckpt_path, final_path)
             
-            # Update latest.txt locally
-            with open(self.out_dir / 'latest.txt', 'w') as f:
-                f.write(fname)
+            if downloaded_path.exists():
+                shutil.move(str(downloaded_path), str(final_path))
+                print(f"✅ Downloaded latest checkpoint: {final_path}")
+                
+                # Clean up the checkpoints folder if empty
+                try:
+                    (self.out_dir / 'checkpoints').rmdir()
+                except:
+                    pass
+                
+                # Update latest.txt locally
+                with open(self.out_dir / 'latest.txt', 'w') as f:
+                    f.write(fname)
+                
+                return str(final_path)
+            else:
+                print(f"⚠️ Downloaded file not found at {downloaded_path}")
+                return None
             
-            print(f"✅ Downloaded latest checkpoint: {final_path}")
-            return str(final_path)
-        
         except Exception as e:
             print(f"⚠️ Failed to download from HF: {e}")
             return None
@@ -1069,32 +1085,51 @@ class GenerationTrainer:
         if self.hf_api is None or not self.hf_repo_id:
             raise ValueError("HF Hub not configured")
         
-        # Get the latest checkpoint name from HF
-        if step is None:
-            # Download the latest.txt file from HF
-            latest_path = hf_hub_download(
+        try:
+            # Get the latest checkpoint name from HF
+            if step is None:
+                # Download the latest.txt file from HF
+                latest_path = hf_hub_download(
+                    repo_id=self.hf_repo_id,
+                    filename="checkpoints/latest.txt",
+                    token=self.hf_token,
+                    local_dir=self.out_dir,  # ← Download directly
+                )
+                with open(latest_path, 'r') as f:
+                    fname = f.read().strip()
+                step = int(fname.split('_')[1])
+            
+            # Download the specific checkpoint
+            ckpt_name = f'step_{step:07d}.pth'
+            print(f"📥 Downloading checkpoint from HF: {ckpt_name}")
+            
+            ckpt_path = hf_hub_download(
                 repo_id=self.hf_repo_id,
-                filename="checkpoints/latest.txt",
+                filename=f"checkpoints/{ckpt_name}",
                 token=self.hf_token,
-                local_dir=self.out_dir / 'temp',
+                local_dir=self.out_dir,  # ← Download directly
             )
-            with open(latest_path, 'r') as f:
-                fname = f.read().strip()
-            step = int(fname.split('_')[1])  # Extract step number
-        
-        # Download the specific checkpoint
-        ckpt_name = f'step_{step:07d}.pth' if step else fname
-        print(f"📥 Downloading checkpoint from HF: {ckpt_name}")
-        
-        ckpt_path = hf_hub_download(
-            repo_id=self.hf_repo_id,
-            filename=f"checkpoints/{ckpt_name}",
-            token=self.hf_token,
-            local_dir=self.out_dir / 'temp',
-        )
-        
-        # Load the checkpoint
-        return self.load_checkpoint(ckpt_path)
+            
+            # The file will be at: self.out_dir / 'checkpoints' / ckpt_name
+            # Move it to the main directory if needed
+            downloaded_path = self.out_dir / 'checkpoints' / ckpt_name
+            final_path = self.out_dir / ckpt_name
+            
+            if downloaded_path.exists() and downloaded_path != final_path:
+                import shutil
+                shutil.move(str(downloaded_path), str(final_path))
+                # Clean up empty folder
+                try:
+                    (self.out_dir / 'checkpoints').rmdir()
+                except:
+                    pass
+            
+            # Load the checkpoint
+            return self.load_checkpoint(str(final_path))
+            
+        except Exception as e:
+            print(f"⚠️ Failed to load from HF: {e}")
+            raise
     
     def get_latest_checkpoint(self) -> Optional[str]:
         """Get the path to the latest local checkpoint."""
